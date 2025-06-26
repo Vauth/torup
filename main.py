@@ -6,7 +6,6 @@ import time
 import asyncio
 from urllib.parse import urlparse, unquote
 from typing import Dict, Any
-from PIL import Image
 
 # Async/HTTP Libraries
 import aiohttp
@@ -19,12 +18,12 @@ from pyrogram.errors import RPCError, FloodWait
 from pyrogram import enums
 
 # --- Bot Configuration ---
-API_ID = 8138160
-API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID = 8138160  # Replace with your API ID
+API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"  # Replace with your API Hash
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # It's recommended to use environment variables
 
 # Initialize the bot
-app = Client("uploader", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("uploader_no_ffmpeg", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # In-memory storage for user states and download data
 user_states: Dict[int, Dict[str, Any]] = {}
@@ -65,39 +64,6 @@ def human_readable_speed(speed_bytes_per_sec, decimal_places=2):
             break
         speed /= 1024.0
     return f"{speed:.{decimal_places}f} {unit}"
-
-
-async def get_video_metadata(file_path: str) -> Dict[str, Any]:
-    """Extracts video metadata using FFmpeg."""
-    process = await asyncio.create_subprocess_exec(
-        'ffmpeg', '-i', file_path,
-        stderr=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE
-    )
-    _, stderr = await process.communicate()
-    
-    output = stderr.decode('utf-8', errors='ignore')
-    metadata = {'duration': 0, 'width': 0, 'height': 0}
-    
-    duration_match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2})\.\d+", output)
-    if duration_match:
-        h, m, s = map(int, duration_match.groups())
-        metadata['duration'] = h * 3600 + m * 60 + s
-
-    stream_match = re.search(r"Stream #\d+:\d+.*: Video: .*?, (\d+)x(\d+)", output)
-    if stream_match:
-        metadata['width'], metadata['height'] = map(int, stream_match.groups())
-        
-    return metadata
-
-async def generate_thumbnail(video_path: str, thumb_path: str) -> bool:
-    """Generates a thumbnail from the video."""
-    process = await asyncio.create_subprocess_exec(
-        'ffmpeg', '-i', video_path, '-ss', '00:00:05', '-vframes', '1', '-vf', 'scale=320:-1', thumb_path,
-        stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
-    )
-    await process.communicate()
-    return os.path.exists(thumb_path)
 
 async def download_file(url: str, file_path: str, progress_message: Message) -> bool:
     """Asynchronously downloads a file with progress updates."""
@@ -154,7 +120,6 @@ async def start_handler(_, message: Message):
         "- Blazing fast async downloads\n"
         "- Live progress and speed indicators\n"
         "- Intelligent media handling (videos are uploaded as videos)\n"
-        "- Automatic thumbnail generation for videos\n"
         "- Option to rename files before uploading",
         parse_mode=enums.ParseMode.MARKDOWN
     )
@@ -273,26 +238,24 @@ async def upload_callback(client: Client, callback_query):
 
     try:
         if mime_type.startswith("video/"):
-            metadata = await get_video_metadata(temp_file)
-            thumb_path = os.path.join(temp_dir, f"{request_id}.jpg")
-            if await generate_thumbnail(temp_file, thumb_path):
-                await client.send_video(
-                    chat_id=callback_query.message.chat.id, video=temp_file,
-                    caption=caption, file_name=filename, progress=progress,
-                    duration=metadata['duration'], width=metadata['width'], height=metadata['height'],
-                    thumb=thumb_path
-                )
-                os.remove(thumb_path)
-            else: # Fallback if thumbnail fails
-                await client.send_video(
-                    chat_id=callback_query.message.chat.id, video=temp_file,
-                    caption=caption, file_name=filename, progress=progress,
-                    duration=metadata['duration'], width=metadata['width'], height=metadata['height']
-                )
+            await client.send_video(
+                chat_id=callback_query.message.chat.id,
+                video=temp_file,
+                caption=caption,
+                file_name=filename,
+                progress=progress,
+                supports_streaming=True # Good practice for videos
+            )
+        # Add elif for audio/images here if desired
+        # elif mime_type.startswith("audio/"):
+        #     await client.send_audio(...)
         else: # Default to document
             await client.send_document(
-                chat_id=callback_query.message.chat.id, document=temp_file,
-                caption=caption, file_name=filename, progress=progress
+                chat_id=callback_query.message.chat.id,
+                document=temp_file,
+                caption=caption,
+                file_name=filename,
+                progress=progress
             )
         await msg.delete()
     except Exception as e:
@@ -302,5 +265,5 @@ async def upload_callback(client: Client, callback_query):
         if request_id in download_requests: del download_requests[request_id]
 
 if __name__ == "__main__":
-    print("Advanced Uploader Bot is running...")
+    print("Advanced Uploader Bot (No-FFmpeg Version) is running...")
     app.run()
