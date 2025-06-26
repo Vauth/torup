@@ -3,3 +3,5 @@ requests
 tqdm
 TgCrypto
 Pillow
+aiohttp
+aiofiles
