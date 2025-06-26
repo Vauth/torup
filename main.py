@@ -2,16 +2,23 @@ import os
 import re
 import mimetypes
 import uuid
-from urllib.parse import urlparse
-from typing import Dict, Any, Tuple, Optional
+import time
+import asyncio
+from urllib.parse import urlparse, unquote
+from typing import Dict, Any
+from PIL import Image
+
+# Async/HTTP Libraries
+import aiohttp
+import aiofiles
+
+# Pyrogram
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import RPCError
+from pyrogram.errors import RPCError, FloodWait
 from pyrogram import enums
-import requests
-from tqdm import tqdm
 
-# Bot configuration
+# --- Bot Configuration ---
 API_ID = 8138160
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -23,249 +30,277 @@ app = Client("uploader", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 user_states: Dict[int, Dict[str, Any]] = {}
 download_requests: Dict[str, Dict[str, str]] = {}
 
+# --- Helper Functions ---
 
-# Helper functions
 def get_filename_from_url(url: str) -> str:
-    """Extract filename from URL"""
     try:
         parsed = urlparse(url)
         if parsed.path:
-            return os.path.basename(parsed.path)
-    except Exception:
-        pass
+            return os.path.basename(unquote(parsed.path))
+    except Exception as e:
+        print(f"Error parsing filename: {e}")
     return "downloaded_file"
 
-
 def get_file_extension(filename: str) -> str:
-    """Get file extension from filename"""
     return os.path.splitext(filename)[1].lower()
 
-
 def get_mime_type(file_path: str) -> str:
-    """Get MIME type of file"""
     mime_type, _ = mimetypes.guess_type(file_path)
     return mime_type or "application/octet-stream"
 
+def clean_filename(filename: str) -> str:
+    return re.sub(r'[^\w\-. ]', '', filename)
 
-def download_file_with_progress(url: str, file_path: str, progress_message: Message) -> bool:
-    """Download file from URL with progress bar"""
+def human_readable_size(size, decimal_places=2):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            break
+        size /= 1024.0
+    return f"{size:.{decimal_places}f} {unit}"
+
+def human_readable_speed(speed_bytes_per_sec, decimal_places=2):
+    speed = speed_bytes_per_sec
+    for unit in ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s']:
+        if speed < 1024.0:
+            break
+        speed /= 1024.0
+    return f"{speed:.{decimal_places}f} {unit}"
+
+
+async def get_video_metadata(file_path: str) -> Dict[str, Any]:
+    """Extracts video metadata using FFmpeg."""
+    process = await asyncio.create_subprocess_exec(
+        'ffmpeg', '-i', file_path,
+        stderr=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE
+    )
+    _, stderr = await process.communicate()
+    
+    output = stderr.decode('utf-8', errors='ignore')
+    metadata = {'duration': 0, 'width': 0, 'height': 0}
+    
+    duration_match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2})\.\d+", output)
+    if duration_match:
+        h, m, s = map(int, duration_match.groups())
+        metadata['duration'] = h * 3600 + m * 60 + s
+
+    stream_match = re.search(r"Stream #\d+:\d+.*: Video: .*?, (\d+)x(\d+)", output)
+    if stream_match:
+        metadata['width'], metadata['height'] = map(int, stream_match.groups())
+        
+    return metadata
+
+async def generate_thumbnail(video_path: str, thumb_path: str) -> bool:
+    """Generates a thumbnail from the video."""
+    process = await asyncio.create_subprocess_exec(
+        'ffmpeg', '-i', video_path, '-ss', '00:00:05', '-vframes', '1', '-vf', 'scale=320:-1', thumb_path,
+        stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
+    )
+    await process.communicate()
+    return os.path.exists(thumb_path)
+
+async def download_file(url: str, file_path: str, progress_message: Message) -> bool:
+    """Asynchronously downloads a file with progress updates."""
+    filename = os.path.basename(file_path)
+    last_update_time = time.time()
+    downloaded_since_last_update = 0
+
     try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, allow_redirects=True) as response:
+                response.raise_for_status()
+                total_size = int(response.headers.get('content-length', 0))
+                
+                async with aiofiles.open(file_path, 'wb') as f:
+                    downloaded_size = 0
+                    async for data in response.content.iter_chunked(131072): # 128KB chunks
+                        await f.write(data)
+                        downloaded_size += len(data)
+                        downloaded_since_last_update += len(data)
+                        current_time = time.time()
 
-        total_size = int(response.headers.get('content-length', 0))
-        block_size = 1024  # 1 Kibibyte
-
-        with open(file_path, 'wb') as f, tqdm(
-            total=total_size,
-            unit='iB',
-            unit_scale=True,
-            desc=f"Downloading {os.path.basename(file_path)}",
-            ncols=100
-        ) as progress:
-            for data in response.iter_content(block_size):
-                progress.update(len(data))
-                f.write(data)
-
-        if total_size != 0 and os.path.getsize(file_path) != total_size:
-            print("ERROR, something went wrong during download")
-            return False
+                        if current_time - last_update_time > 2:
+                            elapsed = current_time - last_update_time
+                            speed = downloaded_since_last_update / elapsed
+                            progress_percent = int((downloaded_size / total_size) * 100) if total_size else 0
+                            
+                            try:
+                                text = (f"⬇️ **Downloading...**\n\n"
+                                        f"📄 `__{filename}__`\n\n"
+                                        f"✅ `{human_readable_size(downloaded_size)}` of `{human_readable_size(total_size)}`\n"
+                                        f"🚀 **Progress:** {progress_percent}%\n"
+                                        f"⚡️ **Speed:** `{human_readable_speed(speed)}`")
+                                await progress_message.edit_text(text, parse_mode=enums.ParseMode.MARKDOWN)
+                            except FloodWait as e:
+                                await asyncio.sleep(e.value)
+                            except Exception: pass
+                            
+                            last_update_time = current_time
+                            downloaded_since_last_update = 0
         return True
     except Exception as e:
-        print(f"Download error: {e}")
+        await progress_message.edit_text(f"❌ **Download failed:**\n`{e}`")
         return False
 
+# --- Bot Handlers ---
 
-def clean_filename(filename: str) -> str:
-    """Clean filename by removing special characters"""
-    return re.sub(r'[^\w\-_. ]', '', filename)
-
-
-# Bot handlers
 @app.on_message(filters.command(["start", "help"]))
-async def start_handler(client: Client, message: Message):
-    """Handle /start and /help commands"""
-    help_text = """
-**Welcome to URL File Uploader Bot!**
-
-📤 Send me a direct download URL and I'll upload the file to Telegram.
-
-🔹 **Features:**
-- Progress bar for downloads/uploads
-- Automatic file type detection
-- Ability to rename files before upload
-- Fast upload speeds
-
-📝 **Usage:**
-1. Send a direct download URL.
-2. The bot will detect the filename.
-3. You can choose to upload with the detected name or rename it first.
-4. The bot will then download and upload the file to our chat.
-
-⚠️ **Note:** This bot works best with direct download links.
-"""
-    await message.reply_text(help_text, parse_mode=enums.ParseMode.MARKDOWN)
-
-
-@app.on_message(filters.regex(r'https?://[^\s]+') & filters.private)
-async def url_handler(client: Client, message: Message):
-    """Handle URL messages"""
-    url = message.text.strip()
-    original_filename = get_filename_from_url(url)
-    clean_name = clean_filename(original_filename)
-    request_id = str(uuid.uuid4())
-
-    download_requests[request_id] = {"url": url, "filename": clean_name}
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Upload with this name", callback_data=f"upload|{request_id}")],
-        [InlineKeyboardButton("Rename before upload", callback_data=f"rename|{request_id}")]
-    ])
-
+async def start_handler(_, message: Message):
+    """Handles /start and /help commands."""
     await message.reply_text(
-        f"🔗 URL received\n\n"
-        f"📄 Detected filename: `{clean_name}`\n\n"
-        f"Choose an option:",
-        reply_markup=keyboard,
+        "**Welcome to the Advanced URL Uploader Bot!**\n\n"
+        "Send me a direct download link and I'll handle the rest.\n\n"
+        "**Features:**\n"
+        "- Blazing fast async downloads\n"
+        "- Live progress and speed indicators\n"
+        "- Intelligent media handling (videos are uploaded as videos)\n"
+        "- Automatic thumbnail generation for videos\n"
+        "- Option to rename files before uploading",
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
+@app.on_message(filters.regex(r'https?://[^\s]+') & filters.private)
+async def url_handler(_, message: Message):
+    """Handles URL messages."""
+    url = message.text.strip()
+    filename = get_filename_from_url(url)
+    if not filename:
+        await message.reply_text("Could not determine a filename from the URL.")
+        return
+
+    request_id = str(uuid.uuid4())
+    download_requests[request_id] = {"url": url, "filename": clean_filename(filename)}
+
+    await message.reply_text(
+        f"🔗 **URL Received**\n📄 Detected filename: `{clean_filename(filename)}`\n\nChoose an option:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬆️ Upload with this name", callback_data=f"upload|{request_id}")],
+            [InlineKeyboardButton("✏️ Rename before upload", callback_data=f"rename|{request_id}")]
+        ]),
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
 
 @app.on_callback_query(filters.regex(r'^rename\|'))
-async def rename_callback(client: Client, callback_query):
-    """Handle rename callback"""
+async def rename_callback(_, callback_query):
+    """Handles rename request."""
     _, request_id = callback_query.data.split('|', 1)
     if request_id not in download_requests:
         await callback_query.answer("Request expired or invalid.", show_alert=True)
         return
 
-    request_data = download_requests[request_id]
-    filename = request_data["filename"]
-
+    filename = download_requests[request_id]["filename"]
     await callback_query.message.edit_text(
-        f"✏️ Please send the new filename (without the extension).\n\n"
-        f"Current filename: `{filename}`\n"
-        f"Detected extension: `{get_file_extension(filename)}`",
+        f"✏️ **Rename File**\n\nSend me the new name for the file (extension is optional).\n\n"
+        f"Current filename: `{filename}`",
         parse_mode=enums.ParseMode.MARKDOWN
     )
+    user_states[callback_query.from_user.id] = {"request_id": request_id}
+    await callback_query.answer()
 
-    user_id = callback_query.from_user.id
-    user_states[user_id] = {"request_id": request_id}
-
-
-@app.on_message(filters.private & ~filters.command(["start", "help"]))
-async def filename_handler(client: Client, message: Message):
-    """Handle filename input after rename request"""
+@app.on_message(filters.private & ~filters.command(["start", "help"]) & ~filters.regex(r'https?://[^\s]+'))
+async def filename_handler(_, message: Message):
+    """Handles filename input after a rename request."""
     user_id = message.from_user.id
-    if user_id not in user_states:
+    if user_id not in user_states or not message.text:
+        await message.reply_text("Please send a URL first to start the process.")
         return
 
-    state = user_states[user_id]
-    request_id = state["request_id"]
-
+    request_id = user_states[user_id]["request_id"]
     if request_id not in download_requests:
         await message.reply_text("Your previous request has expired. Please send the URL again.")
         del user_states[user_id]
         return
 
-    original_filename = download_requests[request_id]["filename"]
-    extension = get_file_extension(original_filename)
-    new_filename_base = clean_filename(message.text.strip())
-    new_filename = f"{new_filename_base}{extension}"
-
+    original_ext = get_file_extension(download_requests[request_id]["filename"])
+    new_name_base = os.path.splitext(message.text.strip())[0] # remove extension if user provides it
+    new_filename = f"{clean_filename(new_name_base)}{original_ext}"
+    
     download_requests[request_id]["filename"] = new_filename
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Upload as {new_filename}", callback_data=f"upload|{request_id}")]
-    ])
-
     await message.reply_text(
-        f"✅ Filename updated!\n\n"
-        f"New filename: `{new_filename}`\n\n"
-        f"Click the button below to start the upload:",
-        reply_markup=keyboard,
+        f"✅ **Filename Updated!**\n\nNew filename: `{new_filename}`\n\nClick the button to start the upload.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"⬆️ Upload as {new_filename}", callback_data=f"upload|{request_id}")]]),
         parse_mode=enums.ParseMode.MARKDOWN
     )
-
     del user_states[user_id]
 
 
 @app.on_callback_query(filters.regex(r'^upload\|'))
 async def upload_callback(client: Client, callback_query):
-    """Handle file upload"""
+    """Handles the final file upload process."""
     _, request_id = callback_query.data.split('|', 1)
     if request_id not in download_requests:
         await callback_query.answer("Request expired or invalid.", show_alert=True)
         return
-
+    
+    await callback_query.answer("Starting process...")
     request_data = download_requests[request_id]
-    url = request_data["url"]
-    filename = request_data["filename"]
+    url, filename = request_data["url"], request_data["filename"]
+    
+    msg = await callback_query.message.edit_text(f"⏳ **Preparing to download...**\n`{filename}`")
+    
+    temp_dir = "temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_file = os.path.join(temp_dir, f"{request_id}_{filename}")
 
-    await callback_query.answer("Starting download...")
-
-    msg = await callback_query.message.edit_text(
-        f"⬇️ Downloading file...\n\n"
-        f"📄 Filename: `{filename}`",
-        parse_mode=enums.ParseMode.MARKDOWN
-    )
-
-    os.makedirs("temp", exist_ok=True)
-    temp_file = os.path.join("temp", filename)
-
-    if not download_file_with_progress(url, temp_file, msg):
-        await msg.edit_text("❌ Failed to download the file. Please check the URL and try again.")
+    if not await download_file(url, temp_file, msg):
+        if request_id in download_requests: del download_requests[request_id]
         return
 
-    file_size = os.path.getsize(temp_file)
+    await msg.edit_text("Processing file for upload...")
     mime_type = get_mime_type(temp_file)
-
-    await msg.edit_text(
-        f"⬆️ Uploading file...\n\n"
-        f"📄 Filename: `{filename}`\n"
-        f"📦 Size: {file_size / 1024 / 1024:.2f} MB\n"
-        f"📝 Type: `{mime_type}`",
-        parse_mode=enums.ParseMode.MARKDOWN
-    )
-
-    last_update_percentage = -1
+    file_size = os.path.getsize(temp_file)
+    caption = f"**File:** `{filename}`\n**Size:** `{human_readable_size(file_size)}`"
+    
+    last_update_time = time.time()
+    last_uploaded_bytes = 0
 
     async def progress(current, total):
-        nonlocal last_update_percentage
-        progress_percent = int((current / total) * 100)
-        if progress_percent > last_update_percentage:
-            last_update_percentage = progress_percent
-            if progress_percent % 5 == 0:
-                try:
-                    await msg.edit_text(
-                        f"⬆️ Uploading file...\n\n"
-                        f"📄 Filename: `{filename}`\n"
-                        f"📦 Size: {file_size / 1024 / 1024:.2f} MB\n"
-                        f"📝 Type: `{mime_type}`\n\n"
-                        f"🚀 Progress: {progress_percent}%",
-                        parse_mode=enums.ParseMode.MARKDOWN
-                    )
-                except Exception:
-                    pass
+        nonlocal last_update_time, last_uploaded_bytes
+        current_time = time.time()
+        if current_time - last_update_time > 2:
+            elapsed = current_time - last_update_time
+            speed = (current - last_uploaded_bytes) / elapsed
+            try:
+                text = (f"⬆️ **Uploading...**\n\n"
+                        f"✅ `{human_readable_size(current)}` of `{human_readable_size(total)}`\n"
+                        f"🚀 **Progress:** {int((current/total)*100)}%\n"
+                        f"⚡️ **Speed:** `{human_readable_speed(speed)}`")
+                await msg.edit_text(text, parse_mode=enums.ParseMode.MARKDOWN)
+            except Exception: pass
+            last_update_time = current_time
+            last_uploaded_bytes = current
 
     try:
-        await client.send_document(
-            chat_id=callback_query.message.chat.id,
-            document=temp_file,
-            file_name=filename,
-            progress=progress,
-            caption=f"📄 `{filename}`"
-        )
-        await msg.edit_text("✅ File uploaded successfully!")
-    except RPCError as e:
-        await msg.edit_text(f"❌ Upload failed: {e}")
+        if mime_type.startswith("video/"):
+            metadata = await get_video_metadata(temp_file)
+            thumb_path = os.path.join(temp_dir, f"{request_id}.jpg")
+            if await generate_thumbnail(temp_file, thumb_path):
+                await client.send_video(
+                    chat_id=callback_query.message.chat.id, video=temp_file,
+                    caption=caption, file_name=filename, progress=progress,
+                    duration=metadata['duration'], width=metadata['width'], height=metadata['height'],
+                    thumb=thumb_path
+                )
+                os.remove(thumb_path)
+            else: # Fallback if thumbnail fails
+                await client.send_video(
+                    chat_id=callback_query.message.chat.id, video=temp_file,
+                    caption=caption, file_name=filename, progress=progress,
+                    duration=metadata['duration'], width=metadata['width'], height=metadata['height']
+                )
+        else: # Default to document
+            await client.send_document(
+                chat_id=callback_query.message.chat.id, document=temp_file,
+                caption=caption, file_name=filename, progress=progress
+            )
+        await msg.delete()
+    except Exception as e:
+        await msg.edit_text(f"❌ **Upload Failed:**\n`{e}`")
     finally:
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-        if request_id in download_requests:
-            del download_requests[request_id]
-
+        if os.path.exists(temp_file): os.remove(temp_file)
+        if request_id in download_requests: del download_requests[request_id]
 
 if __name__ == "__main__":
-    print("Bot is running...")
+    print("Advanced Uploader Bot is running...")
     app.run()
