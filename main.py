@@ -4,29 +4,80 @@ import mimetypes
 import uuid
 import time
 import asyncio
-import shlex
 from urllib.parse import urlparse, unquote
 from typing import Dict, Any, Tuple
 
+# Async/HTTP Libraries
 import aiohttp
 import aiofiles
+
+# Pyrogram
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import RPCError, FloodWait
 from pyrogram import enums
 
 # --- Configuration ---
+# It is highly recommended to use environment variables for security
 API_ID = 8138160
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # --- Global State ---
-app = Client("ultimate_uploader", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("stable_uploader", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 user_states: Dict[int, Dict[str, Any]] = {}
 download_requests: Dict[str, Dict[str, Any]] = {}
-FFMPEG_AVAILABLE = False
 
-# --- Helper Functions ---
+# --- Helper Classes & Functions ---
+
+class ProgressTracker:
+    """A helper class to neatly track upload/download progress."""
+    def __init__(self, message: Message, total_size: int, title: str):
+        self.message = message
+        self.total_size = total_size
+        self.title = title
+        self.start_time = time.time()
+        self.last_update_time = self.start_time
+        self.last_uploaded_bytes = 0
+
+    async def aio_progress(self, downloaded_bytes: int):
+        """Async progress callback for downloads."""
+        now = time.time()
+        if now - self.last_update_time > 2:
+            elapsed = now - self.start_time
+            speed = downloaded_bytes / elapsed if elapsed > 0 else 0
+            progress_percent = int((downloaded_bytes / self.total_size) * 100) if self.total_size > 0 else 0
+            
+            try:
+                text = (f"⬇️ **{self.title}**\n\n"
+                        f"✅ `{human_readable_size(downloaded_bytes)}` of `{human_readable_size(self.total_size)}`\n"
+                        f"🚀 **Progress:** {progress_percent}%\n"
+                        f"⚡️ **Speed:** `{human_readable_speed(speed)}`")
+                await self.message.edit_text(text)
+                self.last_update_time = now
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception:
+                pass # Ignore other edit errors
+
+    async def pyrogram_progress(self, current: int, total: int):
+        """Pyrogram-compatible progress callback for uploads."""
+        now = time.time()
+        if now - self.last_update_time > 2:
+            speed = (current - self.last_uploaded_bytes) / (now - self.last_update_time) if now > self.last_update_time else 0
+            try:
+                text = (f"⬆️ **{self.title}**\n\n"
+                        f"✅ `{human_readable_size(current)}` of `{human_readable_size(total)}`\n"
+                        f"🚀 **Progress:** {int((current/total)*100)}%\n"
+                        f"⚡️ **Speed:** `{human_readable_speed(speed)}`")
+                await self.message.edit_text(text)
+                self.last_update_time = now
+                self.last_uploaded_bytes = current
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception:
+                pass
+
 def clean_filename(filename: str) -> str:
     """Remove invalid characters from a filename."""
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', filename).strip()
@@ -43,122 +94,58 @@ def human_readable_speed(speed, decimal_places=2):
         speed /= 1024.0
     return f"{speed:.{decimal_places}f} {unit}"
 
-async def check_ffmpeg():
-    """Check if FFmpeg is installed and accessible."""
-    global FFMPEG_AVAILABLE
-    try:
-        process = await asyncio.create_subprocess_shell(
-            'ffmpeg -version',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
-        FFMPEG_AVAILABLE = process.returncode == 0
-    except FileNotFoundError:
-        FFMPEG_AVAILABLE = False
-    status = "ENABLED" if FFMPEG_AVAILABLE else "DISABLED (install FFmpeg for thumbnails and metadata)"
-    print(f"FFmpeg support is {status}.")
-
 async def get_file_details_from_url(url: str) -> Tuple[str, str, int]:
     """Fetches filename, content_type, and size from a URL by inspecting headers."""
     async with aiohttp.ClientSession() as session:
-        async with session.head(url, allow_redirects=True) as response:
+        # Use GET with a timeout to fetch headers, as some servers don't support HEAD
+        async with session.get(url, allow_redirects=True, timeout=10) as response:
             response.raise_for_status()
             
             content_disposition = response.headers.get('Content-Disposition')
             filename = ""
             if content_disposition:
-                # Use regex to find filename* or filename=
                 match = re.search(r"filename\*=UTF-8''([\S'\"]+)|filename=\"([^\"]+)\"", content_disposition)
                 if match:
-                    # Prefer the UTF-8 version if it exists
                     raw_filename = match.group(1) or match.group(2)
                     filename = unquote(raw_filename)
 
             if not filename:
-                path = urlparse(response.url).path
-                filename = unquote(os.path.basename(path)) if path else None
+                path = urlparse(str(response.url)).path # Convert yarl.URL to string
+                filename = unquote(os.path.basename(path)) if path and os.path.basename(path) else None
 
-            content_type = response.headers.get('Content-Type')
+            content_type = response.headers.get('Content-Type', 'application/octet-stream')
             if not filename:
-                # Guess extension from MIME type
-                ext = mimetypes.guess_extension(content_type.split(';')[0]) if content_type else ''
+                ext = mimetypes.guess_extension(content_type.split(';')[0])
                 filename = f"download{ext or '.file'}"
 
             size = int(response.headers.get('Content-Length', 0))
             return clean_filename(filename), content_type, size
 
-async def get_video_metadata(file_path: str) -> Dict[str, Any]:
-    """Extracts video metadata using FFmpeg."""
-    if not FFMPEG_AVAILABLE: return {}
-    try:
-        cmd = f"ffprobe -v error -show_format -show_streams -of default=noprint_wrappers=1 {shlex.quote(file_path)}"
-        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0: return {}
-        
-        output = stdout.decode('utf-8', errors='ignore')
-        metadata = {'duration': 0, 'width': 0, 'height': 0}
-        
-        for line in output.split('\n'):
-            if '=' in line:
-                key, value = line.split('=', 1)
-                if key == 'duration' and value != 'N/A': metadata['duration'] = int(float(value))
-                elif key == 'width': metadata['width'] = int(value)
-                elif key == 'height': metadata['height'] = int(value)
-        return metadata if all(metadata.values()) else {}
-    except Exception as e:
-        print(f"FFprobe error: {e}")
-        return {}
-
-async def generate_thumbnail(video_path: str, thumb_path: str) -> bool:
-    """Generates a thumbnail from the video."""
-    if not FFMPEG_AVAILABLE: return False
-    try:
-        cmd = f"ffmpeg -i {shlex.quote(video_path)} -ss 00:00:05 -vframes 1 -vf scale=320:-1 {shlex.quote(thumb_path)}"
-        process = await asyncio.create_subprocess_shell(cmd, stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
-        await process.communicate()
-        return os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0
-    except Exception as e:
-        print(f"Thumbnail generation error: {e}")
-        return False
-
 async def download_file(url: str, file_path: str, progress_message: Message) -> bool:
-    """Asynchronously downloads a file with progress updates."""
-    last_update_time = time.time()
-    downloaded_since_last_update = 0
+    """Asynchronously downloads a file with robust progress updates."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, allow_redirects=True) as response:
                 response.raise_for_status()
                 total_size = int(response.headers.get('Content-Length', 0))
                 
+                tracker = ProgressTracker(progress_message, total_size, "Downloading...")
+                
                 async with aiofiles.open(file_path, 'wb') as f:
                     downloaded_size = 0
                     async for data in response.content.iter_chunked(131072): # 128KB chunks
                         await f.write(data)
                         downloaded_size += len(data)
-                        downloaded_since_last_update += len(data)
-                        current_time = time.time()
-
-                        if current_time - last_update_time > 2:
-                            elapsed = current_time - last_update_time
-                            speed = downloaded_since_last_update / elapsed
-                            progress_percent = int((downloaded_size / total_size) * 100) if total_size else 0
-                            
-                            try:
-                                text = (f"⬇️ **Downloading...**\n\n"
-                                        f"📄 `__{os.path.basename(file_path)}__`\n\n"
-                                        f"✅ `{human_readable_size(downloaded_size)}` of `{human_readable_size(total_size)}`\n"
-                                        f"🚀 **Progress:** {progress_percent}%\n"
-                                        f"⚡️ **Speed:** `{human_readable_speed(speed)}`")
-                                await progress_message.edit_text(text)
-                            except Exception: pass
-                            
-                            last_update_time, downloaded_since_last_update = current_time, 0
+                        await tracker.aio_progress(downloaded_size)
+        
+        # Final progress update to show 100%
+        await progress_message.edit_text("✅ **Download Complete!**\n\nPreparing to upload...")
         return True
+    except asyncio.TimeoutError:
+        await progress_message.edit_text("❌ **Download failed:** The server took too long to respond.")
+        return False
     except Exception as e:
-        await progress_message.edit_text(f"❌ **Download failed:**\n`{e}`")
+        await progress_message.edit_text(f"❌ **Download failed:**\n`{str(e)}`")
         return False
 
 # --- Bot Handlers ---
@@ -166,8 +153,8 @@ async def download_file(url: str, file_path: str, progress_message: Message) -> 
 @app.on_message(filters.command(["start", "help"]))
 async def start_handler(_, message: Message):
     await message.reply_text(
-        "**Welcome to the Ultimate URL Uploader!**\n\n"
-        "Send me a direct download link, and I'll handle the rest. This bot is fast, reliable, and packed with features.",
+        "**Welcome to the Stable URL Uploader!**\n\n"
+        "Send me a direct download link, and I'll handle the rest. This bot is fast, reliable, and easy to use.",
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
@@ -178,13 +165,12 @@ async def url_handler(_, message: Message):
     try:
         filename, content_type, size = await get_file_details_from_url(url)
     except Exception as e:
-        await status_msg.edit(f"❌ **Invalid URL or Unreachable Host.**\n`{e}`")
+        await status_msg.edit(f"❌ **Invalid URL or Unreachable Host.**\n`{str(e)}`")
         return
 
     request_id = str(uuid.uuid4())
-    download_requests[request_id] = {"url": url, "filename": filename, "size": size}
+    download_requests[request_id] = {"url": url, "filename": filename, "size": size, "content_type": content_type}
 
-    # Build dynamic keyboard based on content type
     buttons = []
     mime_group = content_type.split('/')[0] if content_type else ""
     if mime_group == 'video':
@@ -193,29 +179,53 @@ async def url_handler(_, message: Message):
         buttons.append(InlineKeyboardButton("🎵 Upload as Audio", callback_data=f"upload|{request_id}|audio"))
     
     buttons.append(InlineKeyboardButton("📎 Upload as Document", callback_data=f"upload|{request_id}|document"))
-    keyboard = [buttons, [InlineKeyboardButton("✏️ Rename File", callback_data=f"rename|{request_id}")]]
+    keyboard = [buttons, [InlineKeyboardButton("✏️ Rename", callback_data=f"rename|{request_id}")]]
     
     file_info = f"📄 **Filename:** `{filename}`\n"
     if size > 0:
         file_info += f"📦 **Size:** `{human_readable_size(size)}`\n"
-    if content_type:
-        file_info += f"📝 **Type:** `{content_type}`"
+    file_info += f"📝 **Type:** `{content_type}`"
 
     await status_msg.edit(f"✅ **URL Inspected!**\n\n{file_info}\n\nHow would you like to upload this file?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-@app.on_callback_query(filters.regex(r'^rename\|'))
+@app.on_callback_query(filters.regex(r'^(rename|cancel_rename)\|'))
 async def rename_callback(_, callback_query):
-    _, request_id = callback_query.data.split('|', 1)
+    action, request_id = callback_query.data.split('|', 1)
+
+    if action == "cancel_rename":
+        # Restore the original message if cancel is hit
+        original_details = download_requests.get(request_id)
+        if not original_details:
+            await callback_query.message.edit("This request has expired.")
+            return
+        
+        # This part re-builds the original message to restore it
+        filename, content_type, size = original_details['filename'], original_details['content_type'], original_details['size']
+        buttons = []
+        mime_group = content_type.split('/')[0] if content_type else ""
+        if mime_group == 'video':
+            buttons.append(InlineKeyboardButton("🎬 Upload as Video", callback_data=f"upload|{request_id}|video"))
+        elif mime_group == 'audio':
+            buttons.append(InlineKeyboardButton("🎵 Upload as Audio", callback_data=f"upload|{request_id}|audio"))
+        buttons.append(InlineKeyboardButton("📎 Upload as Document", callback_data=f"upload|{request_id}|document"))
+        keyboard = [buttons, [InlineKeyboardButton("✏️ Rename", callback_data=f"rename|{request_id}")]]
+        file_info = f"📄 **Filename:** `{filename}`\n📦 **Size:** `{human_readable_size(size)}`\n📝 **Type:** `{content_type}`"
+        await callback_query.message.edit(f"✅ **URL Inspected!**\n\n{file_info}\n\nHow would you like to upload this file?", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # --- If action is "rename" ---
     if request_id not in download_requests:
         await callback_query.answer("Request expired or invalid.", show_alert=True)
         return
 
-    await callback_query.message.edit_text("✏️ Send me the new filename, including the extension if you wish to change it.")
+    await callback_query.message.edit(
+        "✏️ Send me the new filename, including the extension.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_rename|{request_id}")]]))
     user_states[callback_query.from_user.id] = {"request_id": request_id, "original_message_id": callback_query.message.id}
     await callback_query.answer()
 
-@app.on_message(filters.private & ~filters.command(["start", "help"]) & ~filters.regex(r'https?://[^\s]+'))
-async def filename_handler(_, message: Message):
+@app.on_message(filters.private & ~filters.command() & ~filters.regex(r'https?://'))
+async def filename_handler(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in user_states or not message.text:
         return
@@ -223,38 +233,25 @@ async def filename_handler(_, message: Message):
     state = user_states[user_id]
     request_id = state["request_id"]
     if request_id not in download_requests:
-        await message.reply_text("Your previous request has expired. Please send the URL again.")
+        await message.reply_text("Your previous request has expired. Please send the URL again.", quote=True)
         del user_states[user_id]
         return
 
     new_filename = clean_filename(message.text.strip())
     download_requests[request_id]['filename'] = new_filename
     
-    # Restore the original options with the new filename
-    original_message = await app.get_messages(user_id, state["original_message_id"])
-    original_keyboard = original_message.reply_markup
-    
-    await message.delete() # Clean up the user's message
-    await original_message.edit_text(
-        f"✅ **Filename updated to:** `{new_filename}`\n\nPlease choose an upload option.",
-        reply_markup=original_keyboard
-    )
-    del user_states[user_id]
-
-async def progress_func(current, total, msg, start_time, last_uploaded):
-    now = time.time()
-    if now - last_uploaded['time'] > 2:
-        elapsed = now - start_time
-        speed = current / elapsed
-        text = (f"⬆️ **Uploading...**\n"
-                f"✅ `{human_readable_size(current)}` of `{human_readable_size(total)}`\n"
-                f"🚀 **Progress:** {int((current/total)*100)}%\n"
-                f"⚡️ **Speed:** `{human_readable_speed(speed)}`")
-        try:
-            await msg.edit_text(text)
-            last_uploaded['time'] = now
-        except Exception:
-            pass
+    # Get the original message to restore its keyboard
+    try:
+        original_message = await client.get_messages(user_id, state["original_message_id"])
+        await message.delete()
+        await original_message.edit_text(
+            f"✅ **Filename updated to:** `{new_filename}`\n\nPlease choose an upload option.",
+            reply_markup=original_message.reply_markup
+        )
+    except Exception: # If original message is deleted
+        await message.reply_text(f"✅ **Filename updated to:** `{new_filename}`\n\nBut I couldn't edit the original message. Please send the URL again.")
+    finally:
+        del user_states[user_id]
 
 @app.on_callback_query(filters.regex(r'^upload\|'))
 async def upload_callback(client: Client, callback_query):
@@ -263,57 +260,49 @@ async def upload_callback(client: Client, callback_query):
         await callback_query.answer("Request expired or invalid.", show_alert=True)
         return
     
-    await callback_query.answer("Starting download...")
+    msg = await callback_query.message.edit_text("⏳ Queued for download...")
+    
     request_data = download_requests[request_id]
     url, filename = request_data["url"], request_data["filename"]
-    
-    msg = await callback_query.message.edit_text(f"⏳ **Preparing to download...**\n`{filename}`")
     
     temp_dir = os.path.join(os.getcwd(), "temp")
     os.makedirs(temp_dir, exist_ok=True)
     temp_file = os.path.join(temp_dir, f"{request_id}_{filename}")
-
-    if not await download_file(url, temp_file, msg):
-        if request_id in download_requests: del download_requests[request_id]
-        return
-
-    await msg.edit_text("📥 Download complete. Preparing to upload...")
     
-    file_size = os.path.getsize(temp_file)
-    caption = f"`{filename}`"
-    start_time = time.time()
-    last_uploaded = {'time': start_time}
-
     try:
+        if not await download_file(url, temp_file, msg):
+            return # Error message is sent by download_file
+        
+        file_size = os.path.getsize(temp_file)
+        caption = f"`{filename}`"
+        
+        upload_tracker = ProgressTracker(msg, file_size, "Uploading...")
+        
         if upload_mode == 'video':
-            metadata = await get_video_metadata(temp_file)
-            thumb_path = os.path.join(temp_dir, f"{request_id}.jpg")
-            thumb = thumb_path if await generate_thumbnail(temp_file, thumb_path) else None
             await client.send_video(
                 chat_id=callback_query.message.chat.id, video=temp_file, caption=caption, file_name=filename,
-                duration=metadata.get('duration', 0), width=metadata.get('width', 0), height=metadata.get('height', 0),
-                thumb=thumb, supports_streaming=True, progress=progress_func, progress_args=(msg, start_time, last_uploaded)
+                supports_streaming=True, progress=upload_tracker.pyrogram_progress
             )
-            if thumb: os.remove(thumb)
         elif upload_mode == 'audio':
             await client.send_audio(
                 chat_id=callback_query.message.chat.id, audio=temp_file, caption=caption, file_name=filename,
-                progress=progress_func, progress_args=(msg, start_time, last_uploaded)
+                progress=upload_tracker.pyrogram_progress
             )
         else: # 'document'
             await client.send_document(
                 chat_id=callback_query.message.chat.id, document=temp_file, caption=caption, file_name=filename,
-                progress=progress_func, progress_args=(msg, start_time, last_uploaded)
+                progress=upload_tracker.pyrogram_progress
             )
         await msg.delete()
     except Exception as e:
-        await msg.edit_text(f"❌ **Upload Failed:**\n`{e}`")
+        await msg.edit_text(f"❌ **Upload Failed:**\n`{str(e)}`")
     finally:
-        if os.path.exists(temp_file): os.remove(temp_file)
-        if request_id in download_requests: del download_requests[request_id]
+        # Guaranteed cleanup
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        if request_id in download_requests:
+            del download_requests[request_id]
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(check_ffmpeg())
-    print("Ultimate Uploader Bot is running...")
+    print("Stable Uploader Bot is running...")
     app.run()
