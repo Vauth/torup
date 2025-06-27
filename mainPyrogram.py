@@ -3,28 +3,30 @@ import time
 import uuid
 import asyncio
 import libtorrent as lt
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from pyrogram.errors import FloodWait, MessageNotModified
 import http.server
 import socketserver
 import threading
+import shutil
 from urllib.parse import quote
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.errors import FloodWait, MessageNotModified
 
 # --- Configuration ---
 API_ID = 8138160
 OWNER_ID = 5052959324
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-SERVER_URL = os.environ.get("SERVER_URL")
+# IMPORTANT: Make sure these environment variables are set in your deployment environment
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+SERVER_URL = os.environ.get("SERVER_URL", "your-server-url.com") # e.g., your-app-name.onrender.com
 
 DOWNLOAD_PATH = './downloads/'
 
 # --- File Server Configuration ---
 FILE_SERVER_HOST = "0.0.0.0"  # Listen on all available network interfaces
 FILE_SERVER_PORT = 8080
-# IMPORTANT: This must be your server's public IP or a domain pointing to it
-BASE_URL = f"https://{SERVER_URL}" # <-- CHANGE THIS
+# This is the public URL that points to your file server
+BASE_URL = f"https://{SERVER_URL}"
 
 # --- Bot Globals & Session Setup ---
 app = Client(
@@ -36,7 +38,9 @@ app = Client(
 
 # State management dictionaries
 pending_downloads = {}  # {unique_id: magnet_link}
-active_torrents = {}  # {chat_id: (torrent_handle, asyncio.Task)}
+active_torrents = {}    # {chat_id: (torrent_handle, asyncio.Task)}
+completed_torrents = {} # {info_hash: {'name': str, 'files': list, 'path': str}}
+
 
 # --- Libtorrent Session Optimization ---
 print("Configuring libtorrent session...")
@@ -137,7 +141,6 @@ async def download_task(chat_id, magnet_link, message):
         params = await loop.run_in_executor(None, lt.parse_magnet_uri, magnet_link)
         params.save_path = DOWNLOAD_PATH
         handle = await loop.run_in_executor(None, ses.add_torrent, params)
-
         active_torrents[chat_id] = (handle, asyncio.current_task())
 
         while not await loop.run_in_executor(None, handle.has_metadata):
@@ -168,58 +171,65 @@ async def download_task(chat_id, magnet_link, message):
                 break
             await asyncio.sleep(5)
 
-        if handle.status().state != lt.torrent_status.seeding:
+        if not handle.is_valid() or handle.status().state != lt.torrent_status.seeding:
             if not asyncio.current_task().cancelled():
                 await message.edit_text("❌ **Download Stalled or Failed.**", reply_markup=None)
             return
 
-        await message.edit_text(f"✅ **Download complete!**\n`{ti.name()}`\n\n📤 **Processing and uploading files...**",
-                                reply_markup=None)
+        # --- DOWNLOAD COMPLETE ---
+        await message.edit_text(f"✅ **Download complete!**\n`{ti.name()}`\n\nPreparing direct links...", reply_markup=None)
 
-        files = sorted(ti.files(), key=lambda f: f.path)
-        download_links = []
-        for f in files:
-            file_path = os.path.join(DOWNLOAD_PATH, f.path)
-            if os.path.isfile(file_path):
-                link = await process_completed_file(message, file_path)
-                file_name_display = os.path.basename(f.path)
-                download_links.append(f"📄 [{file_name_display}]({link})")
+        info_hash = str(ti.info_hashes().v1)
+        save_path = handle.status().save_path
         
-        if not download_links:
-            final_message_text = f"🏁 **Finished!**\n\nNo files from `{ti.name()}` were processed or found."
-        else:
-            links_text = "\n".join(download_links)
-            final_message_text = (
-                f"🏁 **Finished!**\n\n"
-                f"All files from `{ti.name()}` have been uploaded to Telegram.\n\n"
-                f"**🔗 Direct Download Links:**\n{links_text}"
-            )
+        # Store details for later use by buttons
+        completed_torrents[info_hash] = {
+            'name': ti.name(),
+            'files': [f for f in ti.files()],
+            'path': save_path
+        }
 
-        # Send a new message with the final result
-        await app.send_message(
-            chat_id,
-            final_message_text,
-            disable_web_page_preview=True
+        # Generate direct download links
+        download_links = []
+        for f in ti.files():
+            file_rel_path = f.path
+            safe_rel_path = quote(file_rel_path)
+            link = f"{BASE_URL}/{safe_rel_path}"
+            file_name_display = os.path.basename(f.path)
+            download_links.append(f"📄 [{file_name_display}]({link})")
+        
+        links_text = "\n".join(download_links)
+        final_message_text = (
+            f"🏁 **Finished!**\n\n"
+            f"Files from `{ti.name()}` are ready.\n\n"
+            f"**🔗 Direct Download Links:**\n{links_text}"
         )
 
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬆️ Upload Files", callback_data=f"upload_{info_hash}")],
+            [InlineKeyboardButton("🗑️ Delete Files", callback_data=f"delete_{info_hash}")]
+        ])
+
+        # Edit the message to show final links and action buttons
+        await message.edit_text(final_message_text, reply_markup=buttons, disable_web_page_preview=True)
 
     except asyncio.CancelledError:
         await message.edit_text("❌ **Download Cancelled.**", reply_markup=None)
     except Exception as e:
-        await message.edit_text(f"❌ **An unexpected error occurred during download:**\n`{e}`", reply_markup=None)
+        error_message = f"❌ **An unexpected error occurred during download:**\n`{e}`"
+        await message.edit_text(error_message, reply_markup=None)
+        print(error_message) # For debugging
     finally:
         if chat_id in active_torrents: del active_torrents[chat_id]
         if handle and handle.is_valid():
-            # We are not deleting files anymore so they can be served.
-            # You may want a different cleanup strategy.
-            ses.remove_torrent(handle)
+            # We keep the torrent in session for potential seeding
+            # but you might want to remove it if you don't need seeding
+            # ses.remove_torrent(handle)
+            pass
 
 
 class UploadProgressReporter:
-    """
-    A stateful class to report upload progress by editing a message.
-    This version fixes the speed calculation bug.
-    """
+    """A stateful class to report upload progress by editing a message."""
     def __init__(self, message, file_name):
         self._message = message
         self._file_name = file_name
@@ -229,61 +239,57 @@ class UploadProgressReporter:
 
     def __call__(self, current_bytes, total_bytes):
         current_time = time.time()
-        
         if current_time - self._last_update_time > 4 or current_bytes == total_bytes:
             elapsed_time = current_time - self._last_update_time
-            if elapsed_time == 0:
-                elapsed_time = 1
-
+            if elapsed_time == 0: elapsed_time = 1
             bytes_since_last = current_bytes - self._last_uploaded_bytes
             speed = bytes_since_last / elapsed_time
             progress = current_bytes / total_bytes
-
             status_text = (
                 f"**📤 Uploading: ** `{self._file_name}`\n\n"
                 f"{progress_bar_str(progress)} **{progress * 100:.2f}%**\n\n"
                 f"**⬆️ Speed:** `{human_readable_size(speed)}/s`\n"
                 f"**📦 Done:** `{human_readable_size(current_bytes)} / {human_readable_size(total_bytes)}`"
             )
-
-            # Schedule the message edit on the event loop
             self._loop.create_task(self.edit_message(status_text))
-            
-            # Update state for the next calculation
             self._last_update_time = current_time
             self._last_uploaded_bytes = current_bytes
 
     async def edit_message(self, text):
-        """Asynchronously edits the message to avoid blocking the callback."""
+        """Asynchronously edits the message to avoid blocking."""
         try:
             await self._message.edit_text(text)
         except (FloodWait, MessageNotModified):
             pass
         except Exception as e:
-            print(f"Error while editing message: {e}")
+            print(f"Error while editing upload progress: {e}")
 
 
-async def process_completed_file(message, file_path):
-    """Handles uploading a single file to Telegram and returns a file server link."""
-    file_name = os.path.basename(file_path)
-    file_rel_path = os.path.relpath(file_path, DOWNLOAD_PATH)
-
-    # --- Upload to Telegram ---
-    reporter = UploadProgressReporter(message, file_name)
-    await app.send_document(
-        chat_id=message.chat.id,
-        document=file_path,
-        caption=f"`{file_name}`",
-        force_document=True,
-        progress=reporter
-    )
-
-    # --- Generate Download Link ---
-    # URL-encode the relative path to handle special characters and subdirectories
-    safe_rel_path = quote(file_rel_path)
-    download_link = f"{BASE_URL}/{safe_rel_path}"
-    
-    return download_link
+def delete_torrent_files(torrent_info):
+    """Deletes all files and the containing folder for a torrent."""
+    if not torrent_info: return False
+    try:
+        # The base path for the torrent might be a single file or a directory
+        torrent_base_path = os.path.join(torrent_info['path'], torrent_info['name'])
+        
+        if os.path.isdir(torrent_base_path):
+            shutil.rmtree(torrent_base_path)
+            print(f"Deleted directory: {torrent_base_path}")
+        elif os.path.isfile(torrent_base_path):
+            os.remove(torrent_base_path)
+            print(f"Deleted file: {torrent_base_path}")
+        else:
+            # Fallback for cases where name doesn't match folder structure
+            # (e.g., torrents with files in the root)
+            for f in torrent_info['files']:
+                file_to_delete = os.path.join(torrent_info['path'], f.path)
+                if os.path.exists(file_to_delete):
+                    os.remove(file_to_delete)
+                    print(f"Deleted file: {file_to_delete}")
+        return True
+    except Exception as e:
+        print(f"Error deleting files for {torrent_info['name']}: {e}")
+        return False
 
 
 # --- Telegram Event Handlers ---
@@ -315,23 +321,18 @@ async def handle_callback(client, callback_query):
     action = data_parts[0]
     payload = data_parts[1] if len(data_parts) > 1 else None
     chat_id = callback_query.message.chat.id
+    message = callback_query.message
 
     if action == "start":
         if chat_id in active_torrents:
             await callback_query.answer("Another download is already active!", show_alert=True)
             return
-
         unique_id = payload
         magnet_link = pending_downloads.pop(unique_id, None)
-
         if not magnet_link:
-            await callback_query.message.edit_text(
+            await message.edit_text(
                 "**❌ This download link has expired. Please send the magnet link again.**", reply_markup=None)
             return
-
-        message = callback_query.message
-        if not message: return
-
         await callback_query.answer("🚀 Download initiated...", show_alert=False)
         await message.edit_text("**⏳ Initializing download...**", reply_markup=None)
         asyncio.create_task(download_task(chat_id, magnet_link, message))
@@ -340,9 +341,53 @@ async def handle_callback(client, callback_query):
         if chat_id in active_torrents:
             handle, task = active_torrents.pop(chat_id)
             task.cancel()
+            if handle.is_valid():
+                ses.remove_torrent(handle)
             await callback_query.answer("❌ Download will be cancelled.", show_alert=True)
         else:
             await callback_query.answer("⚠️ This download is not active.", show_alert=True)
+
+    elif action == "upload":
+        info_hash = payload
+        torrent_info = completed_torrents.get(info_hash)
+        if not torrent_info:
+            await message.edit_text("❌ **Error:** Torrent data expired or already processed.", reply_markup=None)
+            return
+
+        await callback_query.answer("⬆️ Starting upload...", show_alert=False)
+        files_to_upload = sorted(torrent_info['files'], key=lambda f: f.path)
+
+        for f in files_to_upload:
+            file_path = os.path.join(torrent_info['path'], f.path)
+            file_name = os.path.basename(file_path)
+            if os.path.isfile(file_path):
+                reporter = UploadProgressReporter(message, file_name)
+                await client.send_document(
+                    chat_id=chat_id,
+                    document=file_path,
+                    caption=f"`{file_name}`",
+                    force_document=True,
+                    progress=reporter
+                )
+        
+        # After upload, delete the files
+        delete_torrent_files(torrent_info)
+        completed_torrents.pop(info_hash, None) # Clean up state
+        
+        await message.edit_text(f"✅ **Upload complete!**\nFiles for `{torrent_info['name']}` have been sent and deleted from the server.", reply_markup=None)
+
+    elif action == "delete":
+        info_hash = payload
+        torrent_info = completed_torrents.pop(info_hash, None)
+        if not torrent_info:
+            await message.edit_text("❌ **Error:** These files may have already been deleted.", reply_markup=None)
+            return
+
+        await callback_query.answer("🗑️ Deleting files...", show_alert=False)
+        if delete_torrent_files(torrent_info):
+            await message.edit_text(f"✅ **Files Deleted.**\nAll files for `{torrent_info['name']}` have been removed from the server.", reply_markup=None)
+        else:
+            await message.edit_text(f"❌ **Error:** Could not delete files for `{torrent_info['name']}`.", reply_markup=None)
 
 
 # --- Alert Handler & Main Function ---
@@ -361,8 +406,11 @@ async def alert_handler():
 
 
 def main():
-    if not BOT_TOKEN:
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
         print("FATAL: BOT_TOKEN environment variable not set.")
+        return
+    if not SERVER_URL or SERVER_URL == "your-server-url.com":
+        print("FATAL: SERVER_URL environment variable not set.")
         return
 
     # Ensure the download path exists BEFORE starting the server
