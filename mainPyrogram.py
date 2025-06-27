@@ -11,8 +11,6 @@ from pyrogram.errors import FloodWait, MessageNotModified
 API_ID = 8138160
 OWNER_ID = 5052959324 # Make sure this is your correct numeric user ID
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
-# IMPORTANT: It is highly recommended to use environment variables for security.
-# Example: BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 
 DOWNLOAD_PATH = './downloads/'
@@ -84,7 +82,6 @@ async def get_torrent_info_task(magnet_link, message):
         ti = await loop.run_in_executor(None, temp_handle.get_torrent_info)
         await loop.run_in_executor(None, ses.remove_torrent, temp_handle)
 
-        # Use the modern ti.files() method
         files = ti.files()
         file_list = "\n".join([f"📄 `{f.path}` ({human_readable_size(f.size)})" for f in files])
         if len(file_list) > 2048:
@@ -141,7 +138,7 @@ async def download_task(chat_id, magnet_link, message):
             try:
                 await message.edit_text(status_text, reply_markup=buttons)
             except (FloodWait, MessageNotModified):
-                pass # Ignore these common exceptions
+                pass
             except Exception:
                 break
             await asyncio.sleep(5)
@@ -154,12 +151,10 @@ async def download_task(chat_id, magnet_link, message):
         await message.edit_text(f"✅ **Download complete!**\n`{ti.name()}`\n\n📤 **Preparing to upload...**",
                                 reply_markup=None)
 
-        # FIX: Use ti.files() which is the modern, correct way
         files = sorted(ti.files(), key=lambda f: f.path)
         for f in files:
             file_path = os.path.join(DOWNLOAD_PATH, f.path)
             if os.path.isfile(file_path):
-                # We await the upload of each file. The reporter will edit the original message.
                 await upload_file(message, file_path)
 
         await message.edit_text(f"🏁 **Finished!**\n\nAll files from `{ti.name()}` have been successfully uploaded.",
@@ -175,58 +170,69 @@ async def download_task(chat_id, magnet_link, message):
             ses.remove_torrent(handle, lt.session.delete_files)
 
 
+# ------------------------------------------------------------------- #
+# MODIFIED CLASS - This is the fix for the speed calculation          #
+# ------------------------------------------------------------------- #
 class UploadProgressReporter:
-    """A stateful class to report upload progress by editing a message."""
-
+    """
+    A stateful class to report upload progress by editing a message.
+    This version fixes the speed calculation bug.
+    """
     def __init__(self, message, file_name):
         self._message = message
         self._file_name = file_name
+        self._loop = asyncio.get_event_loop()
+        
+        # Initialize time and bytes from the start
         self._last_update_time = time.time()
         self._last_uploaded_bytes = 0
-        self._loop = asyncio.get_event_loop()
 
-    # FIX: This MUST be a regular `def` function, not `async def`.
+    # This is a synchronous callback executed by Pyrogram
     def __call__(self, current_bytes, total_bytes):
         current_time = time.time()
-        if current_time - self._last_update_time < 4 and current_bytes != total_bytes:
-            return
+        
+        # Throttle updates to every 4 seconds to avoid flood waits
+        if current_time - self._last_update_time > 4 or current_bytes == total_bytes:
+            # Calculate speed based on the time elapsed since the last update
+            elapsed_time = current_time - self._last_update_time
+            if elapsed_time == 0:
+                elapsed_time = 1 # Avoid division by zero
 
-        # Schedule the coroutine to run on the event loop.
-        self._loop.create_task(self.update_progress(current_bytes, total_bytes))
-        self._last_update_time = current_time
+            bytes_since_last = current_bytes - self._last_uploaded_bytes
+            speed = bytes_since_last / elapsed_time
+            progress = current_bytes / total_bytes
 
-    async def update_progress(self, current_bytes, total_bytes):
-        """The async part of the progress update logic."""
-        speed_time_diff = time.time() - self._last_update_time
-        if speed_time_diff == 0: speed_time_diff = 1
+            status_text = (
+                f"**📤 Uploading: ** `{self._file_name}`\n\n"
+                f"{progress_bar_str(progress)} **{progress * 100:.2f}%**\n\n"
+                f"**⬆️ Speed:** `{human_readable_size(speed)}/s`\n"
+                f"**📦 Done:** `{human_readable_size(current_bytes)} / {human_readable_size(total_bytes)}`"
+            )
 
-        bytes_since_last_update = current_bytes - self._last_uploaded_bytes
-        speed = bytes_since_last_update / speed_time_diff
-        progress = current_bytes / total_bytes
+            # Schedule the message edit on the event loop
+            self._loop.create_task(self.edit_message(status_text))
+            
+            # Update state for the next calculation
+            self._last_update_time = current_time
+            self._last_uploaded_bytes = current_bytes
 
-        status_text = (
-            f"**📤 Uploading: ** `{self._file_name}`\n\n"
-            f"{progress_bar_str(progress)} **{progress * 100:.2f}%**\n\n"
-            f"**⬆️ Speed:** `{human_readable_size(speed)}/s`\n"
-            f"**📦 Done:** `{human_readable_size(current_bytes)} / {human_readable_size(total_bytes)}`"
-        )
-
+    async def edit_message(self, text):
+        """Asynchronously edits the message to avoid blocking the callback."""
         try:
-            await self._message.edit_text(status_text, reply_markup=None)
+            await self._message.edit_text(text)
         except (FloodWait, MessageNotModified):
-            pass # Ignore these errors
+            pass # Ignore these common exceptions
         except Exception as e:
-            print(f"Error updating upload progress: {e}")
-
-        self._last_uploaded_bytes = current_bytes
-
+            print(f"Error while editing message: {e}")
+# ------------------------------------------------------------------- #
+# End of modified class                                               #
+# ------------------------------------------------------------------- #
 
 async def upload_file(message, file_path):
     """Handles uploading a single file with a detailed progress reporter."""
     file_name = os.path.basename(file_path)
     reporter = UploadProgressReporter(message, file_name)
 
-    # A new message is created for the file, but the reporter will keep editing the original status message.
     await app.send_document(
         chat_id=message.chat.id,
         document=file_path,
@@ -251,7 +257,6 @@ async def start(client, message):
 
 @app.on_message(filters.regex(r"^magnet:.*") & filters.private)
 async def handle_magnet(client, message):
-    # It's good practice to restrict commands to the owner
     if message.from_user.id != OWNER_ID: 
         await message.reply_text("Sorry, you are not authorized to use this bot.")
         return
@@ -311,7 +316,7 @@ async def alert_handler():
         try:
             alerts = await loop.run_in_executor(None, ses.pop_alerts)
             for alert in alerts:
-                if alert.what() and "outstanding" not in alert.message(): # Filter noisy alerts
+                if alert.what() and "outstanding" not in alert.message():
                     print(f"[Libtorrent Alert: {alert.what()}] {alert.message()}")
             await asyncio.sleep(2)
         except Exception as e:
@@ -325,7 +330,6 @@ def main():
 
     if not os.path.exists(DOWNLOAD_PATH): os.makedirs(DOWNLOAD_PATH)
 
-    # Start the alert handler as a background asyncio task
     asyncio.get_event_loop().create_task(alert_handler())
 
     print("Bot has started successfully. Listening for magnet links...")
