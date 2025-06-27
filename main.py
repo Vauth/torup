@@ -37,7 +37,7 @@ print("Session configured.")
 
 # --- Helper Functions ---
 def human_readable_size(size, decimal_places=2):
-    for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size < 1024.0: break
         size /= 1024.0
     return f"{size:.{decimal_places}f} {unit}"
@@ -57,7 +57,7 @@ async def get_torrent_info_task(magnet_link, message):
         params.save_path = DOWNLOAD_PATH
         temp_handle = await loop.run_in_executor(None, ses.add_torrent, params)
 
-        await message.edit('*🔎 Fetching torrent details...*')
+        await message.edit('**🔎 Fetching torrent details...**')
 
         for _ in range(60): # Timeout after ~60 seconds
             if await loop.run_in_executor(None, temp_handle.has_metadata):
@@ -114,7 +114,7 @@ async def download_task(chat_id, magnet_link, message):
             
             status_text = (
                 f"**🚀 Downloading: ** `{ti.name()}`\n\n"
-                f"`{progress_bar_str(s.progress)}` **{s.progress*100:.2f}%**\n\n"
+                f"{progress_bar_str(s.progress)} **{s.progress*100:.2f}%**\n\n"
                 f"**⬇️ Speed:** `{human_readable_size(s.download_rate)}/s`\n"
                 f"**⬆️ Speed:** `{human_readable_size(s.upload_rate)}/s`\n"
                 f"**📦 Done:** `{human_readable_size(s.total_done)} / {human_readable_size(s.total_wanted)}`\n"
@@ -173,7 +173,7 @@ class UploadProgressReporter:
         progress = current_bytes / total_bytes
         status_text = (
             f"**📤 Uploading: ** `{self._file_name}`\n\n"
-            f"`{progress_bar_str(progress)}` **{progress*100:.2f}%**\n\n"
+            f"{progress_bar_str(progress)} **{progress*100:.2f}%**\n\n"
             f"**⬆️ Speed:** `{human_readable_size(speed)}/s`\n"
             f"**📦 Done:** `{human_readable_size(current_bytes)} / {human_readable_size(total_bytes)}`"
         )
@@ -216,7 +216,7 @@ async def start(event):
 @client.on(events.NewMessage(pattern='magnet:.*'))
 async def handle_magnet(event):
     if event.chat_id in active_torrents:
-        await event.respond("A download is already active in this chat. Please wait or cancel it first.")
+        await event.respond("**⚠️ A download is already active in this chat. Please wait or cancel it first.**")
         return
     bot_message = await event.respond('⏳ **Validating magnet link...**')
     asyncio.create_task(get_torrent_info_task(event.text, bot_message))
@@ -238,24 +238,24 @@ async def handle_callback(event):
         magnet_link = pending_downloads.pop(unique_id, None)
         
         if not magnet_link:
-            await event.edit("*❌ This download link has expired. Please send the magnet link again.*", buttons=None)
+            await event.edit("**❌ This download link has expired. Please send the magnet link again.**", buttons=None)
             return
 
         message = await event.get_message()
         if not message: return
 
-        await event.answer("*🚀 Download initiated...*")
+        await event.answer("**🚀 Download initiated...**")
         # **BUG FIX**: This edit call reliably removes the "Download" button
-        await message.edit("*⏳ Initializing download...*", buttons=None)
+        await message.edit("**⏳ Initializing download...**", buttons=None)
         asyncio.create_task(download_task(chat_id, magnet_link, message))
 
     elif action == "cancel":
         if chat_id in active_torrents:
             handle, task = active_torrents.pop(chat_id)
             task.cancel()
-            await event.answer("*❌ Download will be cancelled.*", alert=True)
+            await event.answer("**❌ Download will be cancelled.**", alert=True)
         else:
-            await event.answer("*This download is not active.*", alert=True)
+            await event.answer("**⚠️ This download is not active.**", alert=True)
 
 # --- Alert Handler & Main Function ---
 async def alert_handler():
