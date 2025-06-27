@@ -374,7 +374,7 @@ async def handle_callback(client, callback_query):
                     chat_id=chat_id,
                     document=file_path,
                     caption=f"`{file_name}`",
-                    force_document=True,
+                    force_document=False,
                     progress=reporter
                 )
         
