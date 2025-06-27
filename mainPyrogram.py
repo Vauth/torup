@@ -101,16 +101,16 @@ async def get_torrent_info_task(magnet_link, message):
 
 
 async def download_task(chat_id, magnet_link, message):
-    """The main task that handles the download and progress updates."""
+    """The main task that handles download, progress, and sequential uploads."""
     loop = asyncio.get_event_loop()
     handle = None
     try:
         params = await loop.run_in_executor(None, lt.parse_magnet_uri, magnet_link)
         params.save_path = DOWNLOAD_PATH
         handle = await loop.run_in_executor(None, ses.add_torrent, params)
-
         active_torrents[chat_id] = (handle, asyncio.current_task())
 
+        # --- Download Loop (same as your original code) ---
         while not await loop.run_in_executor(None, handle.has_metadata):
             await asyncio.sleep(0.5)
         ti = await loop.run_in_executor(None, handle.get_torrent_info)
@@ -118,7 +118,6 @@ async def download_task(chat_id, magnet_link, message):
         while handle.is_valid() and not handle.status().is_seeding:
             s = handle.status()
             state_str = ['Queued', 'Checking', 'DL Metadata', 'Downloading', 'Finished', 'Seeding', 'Allocating', 'Checking resume'][s.state]
-
             status_text = (
                 f"**🚀 Downloading: ** `{ti.name()}`\n\n"
                 f"{progress_bar_str(s.progress)} **{s.progress*100:.2f}%**\n\n"
@@ -128,7 +127,6 @@ async def download_task(chat_id, magnet_link, message):
                 f"**👤 Peers:** `{s.num_peers}` | **🚦 Status:** `{state_str}`"
             )
             buttons = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{chat_id}")]])
-
             try:
                 await message.edit_text(status_text, reply_markup=buttons)
             except FloodWait as fw:
@@ -137,30 +135,53 @@ async def download_task(chat_id, magnet_link, message):
                 break
             await asyncio.sleep(5)
 
-        # Check if the download was cancelled or failed
         if not (handle.is_valid() and handle.status().is_seeding):
             if not asyncio.current_task().cancelled():
-                 await message.edit_text("❌ **Download Stalled or Failed.**", reply_markup=None)
+                await message.edit_text("❌ **Download Stalled or Failed.**", reply_markup=None)
             return
+        # --- End of Download Loop ---
 
-        # Edit the same message to show the upload is starting
         await message.edit_text(f"✅ **Download complete!**\n`{ti.name()}`\n\n📤 **Preparing to upload...**", reply_markup=None)
 
+        # --- NEW: Improved Upload Logic ---
         files = sorted([ti.file_at(i) for i in range(ti.num_files())], key=lambda f: f.path)
-        for f in files:
+        for i, f in enumerate(files):
             file_path = os.path.join(DOWNLOAD_PATH, f.path)
             if os.path.isfile(file_path):
-                # The upload_file function will send the document and the reporter
-                # will edit the original `message` object with upload progress.
-                await upload_file(message, file_path)
+                file_name = os.path.basename(file_path)
 
-        # After all files are uploaded, edit the message to the final status.
+                # This message edit is crucial. It persists while the file uploads.
+                await message.edit_text(
+                    f"**📤 Uploading file {i+1} of {len(files)}...**\n"
+                    f"`{file_name}`"
+                )
+
+                # The reporter will now edit the message with detailed progress.
+                reporter = UploadProgressReporter(message, file_name)
+
+                await app.send_document(
+                    chat_id=message.chat.id,
+                    document=file_path,
+                    caption=f"`{file_name}`",
+                    force_document=True,
+                    progress=reporter
+                )
+
+                # Clean up the file after successful upload
+                try:
+                    os.remove(file_path)
+                    # Clean up empty parent directories
+                    if os.path.isdir(os.path.dirname(file_path)) and not os.listdir(os.path.dirname(file_path)):
+                        os.removedirs(os.path.dirname(file_path))
+                except (OSError, Exception) as e:
+                    print(f"Error cleaning up file {file_path}: {e}")
+
         await message.edit_text(f"🏁 **Finished!**\n\nAll files from `{ti.name()}` have been successfully uploaded.", reply_markup=None)
 
     except asyncio.CancelledError:
         await message.edit_text("❌ **Download Cancelled.**", reply_markup=None)
     except Exception as e:
-        await message.edit_text(f"❌ **An unexpected error occurred during download:**\n`{e}`", reply_markup=None)
+        await message.edit_text(f"❌ **An unexpected error occurred during download/upload:**\n`{e}`", reply_markup=None)
     finally:
         if chat_id in active_torrents: del active_torrents[chat_id]
         if handle and handle.is_valid():
