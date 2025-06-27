@@ -5,6 +5,7 @@ import asyncio
 import libtorrent as lt
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.errors import FloodWait
 
 # --- Configuration ---
 API_ID = 8138160
@@ -15,7 +16,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DOWNLOAD_PATH = './downloads/'
 
 # --- Bot Globals & Session Setup ---
-# Pyrogram uses a different session string name by default.
 app = Client(
     "pyro_tornet_bot",
     api_id=API_ID,
@@ -131,29 +131,31 @@ async def download_task(chat_id, magnet_link, message):
 
             try:
                 await message.edit_text(status_text, reply_markup=buttons)
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value)
             except Exception:
                 break
             await asyncio.sleep(5)
 
+        # Check if the download was cancelled or failed
         if not (handle.is_valid() and handle.status().is_seeding):
             if not asyncio.current_task().cancelled():
-                await message.edit_text("❌ **Download Stalled or Failed.**", reply_markup=None)
+                 await message.edit_text("❌ **Download Stalled or Failed.**", reply_markup=None)
             return
 
-        await message.edit_text(f"✅ **Download complete!**\n`{ti.name()}`\n\n📤 Preparing to upload...", reply_markup=None)
-
-        # In Pyrogram, you can't edit the message that you are using for the progress callback of an upload.
-        # So we send a new message to show upload status.
-        upload_status_msg = await app.send_message(chat_id, f"Starting upload of `{ti.name()}`...")
+        # Edit the same message to show the upload is starting
+        await message.edit_text(f"✅ **Download complete!**\n`{ti.name()}`\n\n📤 **Preparing to upload...**", reply_markup=None)
 
         files = sorted([ti.file_at(i) for i in range(ti.num_files())], key=lambda f: f.path)
         for f in files:
             file_path = os.path.join(DOWNLOAD_PATH, f.path)
             if os.path.isfile(file_path):
-                await upload_file(chat_id, upload_status_msg, file_path)
+                # The upload_file function will send the document and the reporter
+                # will edit the original `message` object with upload progress.
+                await upload_file(message, file_path)
 
-        await upload_status_msg.edit_text(f"🏁 **Finished!**\n\nAll files from `{ti.name()}` have been successfully uploaded.")
-        await message.delete() # clean up original message
+        # After all files are uploaded, edit the message to the final status.
+        await message.edit_text(f"🏁 **Finished!**\n\nAll files from `{ti.name()}` have been successfully uploaded.", reply_markup=None)
 
     except asyncio.CancelledError:
         await message.edit_text("❌ **Download Cancelled.**", reply_markup=None)
@@ -164,8 +166,9 @@ async def download_task(chat_id, magnet_link, message):
         if handle and handle.is_valid():
             await loop.run_in_executor(None, ses.remove_torrent, handle)
 
+
 class UploadProgressReporter:
-    """A stateful class to report upload progress with speed calculation for Pyrogram."""
+    """A stateful class to report upload progress by editing a message."""
     def __init__(self, message, file_name):
         self._message = message
         self._file_name = file_name
@@ -174,15 +177,17 @@ class UploadProgressReporter:
 
     async def __call__(self, current_bytes, total_bytes):
         current_time = time.time()
-        # Update every 5 seconds to avoid hitting flood limits
-        if current_time - self._last_update_time < 5 and current_bytes != total_bytes:
+        # Update every 4 seconds to avoid hitting flood limits
+        if current_time - self._last_update_time < 4 and current_bytes != total_bytes:
             return
 
         elapsed_time = current_time - self._last_update_time
+        if elapsed_time == 0: elapsed_time = 1 # Avoid division by zero
+        
         bytes_since_last_update = current_bytes - self._last_uploaded_bytes
-        speed = bytes_since_last_update / elapsed_time if elapsed_time > 0 else 0
-
+        speed = bytes_since_last_update / elapsed_time
         progress = current_bytes / total_bytes
+        
         status_text = (
             f"**📤 Uploading: ** `{self._file_name}`\n\n"
             f"{progress_bar_str(progress)} **{progress*100:.2f}%**\n\n"
@@ -191,23 +196,27 @@ class UploadProgressReporter:
         )
 
         try:
+            # Edit the message with the upload progress
             await self._message.edit_text(status_text, reply_markup=None)
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value)
         except Exception:
-            pass
+            pass # Ignore other errors like message not modified
 
         self._last_update_time = current_time
         self._last_uploaded_bytes = current_bytes
 
 
-async def upload_file(chat_id, message, file_path):
+async def upload_file(message, file_path):
     """Handles uploading a single file with a detailed progress reporter."""
     file_name = os.path.basename(file_path)
+    # The reporter will edit the 'message' object it's given.
     reporter = UploadProgressReporter(message, file_name)
 
     await app.send_document(
-        chat_id,
+        chat_id=message.chat.id,
         document=file_path,
-        caption=file_name,
+        caption=f"`{file_name}`",
         force_document=True,
         progress=reporter
     )
@@ -216,7 +225,7 @@ async def upload_file(chat_id, message, file_path):
         # Clean up empty parent directories
         if os.path.isdir(os.path.dirname(file_path)) and not os.listdir(os.path.dirname(file_path)):
              os.removedirs(os.path.dirname(file_path))
-    except OSError:
+    except (OSError, Exception):
         pass
 
 
@@ -287,31 +296,23 @@ async def alert_handler():
             print(f"Alert handler error: {e}")
 
 
-async def main():
+def main():
     if not BOT_TOKEN:
         print("FATAL: BOT_TOKEN environment variable not set.")
         return
 
     if not os.path.exists(DOWNLOAD_PATH): os.makedirs(DOWNLOAD_PATH)
 
-    print("Bot is starting...")
-    # Using 'with' context manager is cleaner for starting/stopping the client
-    async with app:
-        # Run the alert handler as a background task
-        alert_task = asyncio.create_task(alert_handler())
-        print("Bot has started successfully. Listening for commands...")
-        # Pyrogram's app.run() would block, so we keep the script alive differently
-        await asyncio.Event().wait() # Keep running indefinitely
-        alert_task.cancel()
+    # Start the alert handler as a background asyncio task
+    asyncio.get_event_loop().create_task(alert_handler())
+    
+    print("Bot has started successfully. Listening for magnet links...")
+    app.run() # This will block and run the bot
+    print("Bot stopped.")
 
 
 if __name__ == '__main__':
     try:
-        # Pyrogram's run() method handles the asyncio event loop setup.
-        print("Starting Pyrogram client...")
-        # We start the alert handler manually since app.run() will block the main thread.
-        asyncio.get_event_loop().create_task(alert_handler())
-        app.run()
-        print("Bot stopped.")
+        main()
     except Exception as e:
         print(f"A critical error occurred in main: {e}")
