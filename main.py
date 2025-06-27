@@ -303,7 +303,7 @@ async def start(client, message):
             [InlineKeyboardButton("Updates", url="https://t.me/execal")]
         ]
     )
-    await message.reply_text(f'[⁪⁬⁮⁮⁮⁮](https://i.ibb.co/bR8tDYC5/e838f480e29a.jpg)Hi {mention} !\n**I'm a torrent uploader.**\nSend me a magnet link to begin.', reply_markup=keyboard)
+    await message.reply_text(f"[⁪⁬⁮⁮⁮⁮](https://i.ibb.co/bR8tDYC5/e838f480e29a.jpg)Hi {mention} !\n**I'm a torrent uploader.**\nSend me a magnet link to begin.", reply_markup=keyboard)
 
 
 @app.on_message(filters.regex(r"^magnet:.*"))
