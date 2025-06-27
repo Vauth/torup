@@ -2,9 +2,18 @@ import os
 import time
 import uuid
 import asyncio
+import logging
 import libtorrent as lt
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+
+# --- Enable Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- Configuration ---
 API_ID = 8138160
