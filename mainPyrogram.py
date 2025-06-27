@@ -225,7 +225,7 @@ async def upload_file(message, file_path):
         chat_id=message.chat.id,
         document=file_path,
         caption=f"`{file_name}`",
-        force_document=True,
+        force_document=False,
         progress=reporter
     )
     try:
