@@ -15,7 +15,7 @@ from urllib.parse import quote
 API_ID = 8138160
 OWNER_ID = 5052959324
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
-BOT_TOKEN = os.environ.get("BOT_TOKEN")\
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SERVER_URL = os.environ.get("SERVER_URL")
 
 DOWNLOAD_PATH = './downloads/'
