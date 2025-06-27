@@ -16,21 +16,19 @@ from pyrogram.errors import FloodWait, MessageNotModified
 API_ID = 8138160
 OWNER_ID = 5052959324
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
-# IMPORTANT: Make sure these environment variables are set in your deployment environment
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
-SERVER_URL = os.environ.get("SERVER_URL", "your-server-url.com") # e.g., your-app-name.onrender.com
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SERVER_URL = os.environ.get("SERVER_URL")
 
 DOWNLOAD_PATH = './downloads/'
 
 # --- File Server Configuration ---
 FILE_SERVER_HOST = "0.0.0.0"  # Listen on all available network interfaces
 FILE_SERVER_PORT = 8080
-# This is the public URL that points to your file server
 BASE_URL = f"https://{SERVER_URL}"
 
 # --- Bot Globals & Session Setup ---
 app = Client(
-    "pyro_tornet_bot",
+    "tornet",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
@@ -74,9 +72,16 @@ def progress_bar_str(progress, length=10):
 
 # --- File Server ---
 def start_file_server():
-    """Starts a simple HTTP server in a separate thread."""
-    # We must serve from the download directory
-    class MyHandler(http.server.SimpleHTTPRequestHandler):
+    """Starts a simple HTTP server in a separate thread that disallows directory listing."""
+
+    class NoListHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if os.path.isdir(self.translate_path(self.path)):
+                self.send_error(403, "I can imagine how smart you are.")
+                return
+            super().do_GET()
+    
+    class MyHandler(NoListHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=DOWNLOAD_PATH, **kwargs)
 
@@ -210,7 +215,6 @@ async def download_task(chat_id, magnet_link, message):
             [InlineKeyboardButton("🗑️ Delete Files", callback_data=f"delete_{info_hash}")]
         ])
 
-        # Edit the message to show final links and action buttons
         await message.edit_text(final_message_text, reply_markup=buttons, disable_web_page_preview=True)
 
     except asyncio.CancelledError:
@@ -222,9 +226,6 @@ async def download_task(chat_id, magnet_link, message):
     finally:
         if chat_id in active_torrents: del active_torrents[chat_id]
         if handle and handle.is_valid():
-            # We keep the torrent in session for potential seeding
-            # but you might want to remove it if you don't need seeding
-            # ses.remove_torrent(handle)
             pass
 
 
@@ -269,7 +270,6 @@ def delete_torrent_files(torrent_info):
     """Deletes all files and the containing folder for a torrent."""
     if not torrent_info: return False
     try:
-        # The base path for the torrent might be a single file or a directory
         torrent_base_path = os.path.join(torrent_info['path'], torrent_info['name'])
         
         if os.path.isdir(torrent_base_path):
@@ -279,8 +279,6 @@ def delete_torrent_files(torrent_info):
             os.remove(torrent_base_path)
             print(f"Deleted file: {torrent_base_path}")
         else:
-            # Fallback for cases where name doesn't match folder structure
-            # (e.g., torrents with files in the root)
             for f in torrent_info['files']:
                 file_to_delete = os.path.join(torrent_info['path'], f.path)
                 if os.path.exists(file_to_delete):
@@ -370,9 +368,8 @@ async def handle_callback(client, callback_query):
                     progress=reporter
                 )
         
-        # After upload, delete the files
         delete_torrent_files(torrent_info)
-        completed_torrents.pop(info_hash, None) # Clean up state
+        completed_torrents.pop(info_hash, None)
         
         await message.edit_text(f"✅ **Upload complete!**\nFiles for `{torrent_info['name']}` have been sent and deleted from the server.", reply_markup=None)
 
@@ -413,11 +410,9 @@ def main():
         print("FATAL: SERVER_URL environment variable not set.")
         return
 
-    # Ensure the download path exists BEFORE starting the server
     if not os.path.exists(DOWNLOAD_PATH):
         os.makedirs(DOWNLOAD_PATH)
 
-    # Start the file server in a daemon thread
     server_thread = threading.Thread(target=start_file_server, daemon=True)
     server_thread.start()
 
