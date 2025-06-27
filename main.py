@@ -44,7 +44,7 @@ def human_readable_size(size, decimal_places=2):
 
 def progress_bar_str(progress, length=10):
     filled_len = int(length * progress)
-    return '▓' * filled_len + '░' * (length - filled_len)
+    return '▰' * filled_len + '▱' * (length - filled_len)
 
 # --- Core Logic ---
 
@@ -57,7 +57,7 @@ async def get_torrent_info_task(magnet_link, message):
         params.save_path = DOWNLOAD_PATH
         temp_handle = await loop.run_in_executor(None, ses.add_torrent, params)
 
-        await message.edit('🔎 Fetching torrent details... (This can take a moment)')
+        await message.edit('*🔎 Fetching torrent details...*')
 
         for _ in range(60): # Timeout after ~60 seconds
             if await loop.run_in_executor(None, temp_handle.has_metadata):
@@ -77,7 +77,7 @@ async def get_torrent_info_task(magnet_link, message):
             file_list = file_list[:2048] + "\n..."
 
         details_text = (
-            f"✅ **Torrent Details Ready**\n\n"
+            f"✅ **Torrent Details**\n\n"
             f"**🏷️ Name:** `{ti.name()}`\n"
             f"**🗂️ Size:** {human_readable_size(ti.total_size())}\n\n"
             f"**📦 Files:**\n{file_list}"
@@ -238,24 +238,24 @@ async def handle_callback(event):
         magnet_link = pending_downloads.pop(unique_id, None)
         
         if not magnet_link:
-            await event.edit("❌ This download link has expired. Please send the magnet link again.", buttons=None)
+            await event.edit("*❌ This download link has expired. Please send the magnet link again.*", buttons=None)
             return
 
         message = await event.get_message()
         if not message: return
 
-        await event.answer("🚀 Download initiated...")
+        await event.answer("*🚀 Download initiated...*")
         # **BUG FIX**: This edit call reliably removes the "Download" button
-        await message.edit("⏳ Initializing download...", buttons=None)
+        await message.edit("*⏳ Initializing download...*", buttons=None)
         asyncio.create_task(download_task(chat_id, magnet_link, message))
 
     elif action == "cancel":
         if chat_id in active_torrents:
             handle, task = active_torrents.pop(chat_id)
             task.cancel()
-            await event.answer("❌ Download will be cancelled.", alert=True)
+            await event.answer("*❌ Download will be cancelled.*", alert=True)
         else:
-            await event.answer("This download is not active.", alert=True)
+            await event.answer("*This download is not active.*", alert=True)
 
 # --- Alert Handler & Main Function ---
 async def alert_handler():
