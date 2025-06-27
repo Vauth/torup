@@ -1,4 +1,3 @@
-telethon
 pyrogram
 TgCrypto
 libtorrent
