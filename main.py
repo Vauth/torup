@@ -291,12 +291,12 @@ def delete_torrent_files(torrent_info):
 
 
 # --- Telegram Event Handlers ---
-@app.on_message(filters.command("start") & filters.private)
+@app.on_message(filters.command("start"))
 async def start(client, message):
     await message.reply_text('**Welcome to your Ultimate Torrent Downloader!**\n\nSend me a magnet link to begin.')
 
 
-@app.on_message(filters.regex(r"^magnet:.*") & filters.private)
+@app.on_message(filters.regex(r"^magnet:.*"))
 async def handle_magnet(client, message):
     if message.from_user.id != OWNER_ID:
         await message.reply_text("**🚫 Sorry, you are not authorized to use this bot.**")
