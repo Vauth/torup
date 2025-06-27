@@ -157,7 +157,7 @@ async def download_task(chat_id, magnet_link, message):
                 )
 
                 # The reporter will now edit the message with detailed progress.
-                reporter = UploadProgressReporter(message, file_name)
+                reporter = await UploadProgressReporter(message, file_name)
 
                 await app.send_document(
                     chat_id=message.chat.id,
