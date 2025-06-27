@@ -1,28 +1,28 @@
 import os
 import time
 import uuid
+import shutil
 import asyncio
-import libtorrent as lt
+import threading
 import http.server
 import socketserver
-import threading
-import shutil
+import libtorrent as lt
 from urllib.parse import quote
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
 
 # --- Configuration ---
 API_ID = 8138160
-OWNER_ID = 5052959324
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID"))
 SERVER_URL = os.environ.get("SERVER_URL")
-
 DOWNLOAD_PATH = './downloads/'
 
 # --- File Server Configuration ---
-FILE_SERVER_HOST = "0.0.0.0"  # Listen on all available network interfaces
+FILE_SERVER_HOST = "0.0.0.0"
 FILE_SERVER_PORT = 8080
 BASE_URL = f"https://{SERVER_URL}"
 
@@ -77,7 +77,7 @@ def start_file_server():
     class NoListHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
             if os.path.isdir(self.translate_path(self.path)):
-                self.send_error(403, "I can imagine how smart you are.")
+                self.send_error(403, "I can imagine how smart you are")
                 return
             super().do_GET()
     
