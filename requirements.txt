@@ -1,7 +1,2 @@
-pyrogram
-requests
-tqdm
-TgCrypto
-Pillow
-aiohttp
-aiofiles
+telethon
+aiotorrent
