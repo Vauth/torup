@@ -9,7 +9,7 @@ from pyrogram.errors import FloodWait, MessageNotModified
 
 # --- Configuration ---
 API_ID = 8138160
-OWNER_ID = 5052959324 # Make sure this is your correct numeric user ID
+OWNER_ID = 5052959324
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 
@@ -69,7 +69,7 @@ async def get_torrent_info_task(magnet_link, message):
 
         await message.edit_text('**🔎 Fetching torrent details...**')
 
-        for _ in range(60):  # Timeout after ~60 seconds
+        for _ in range(60):
             if await loop.run_in_executor(None, temp_handle.has_metadata):
                 break
             await asyncio.sleep(1)
@@ -169,10 +169,6 @@ async def download_task(chat_id, magnet_link, message):
         if handle and handle.is_valid():
             ses.remove_torrent(handle, lt.session.delete_files)
 
-
-# ------------------------------------------------------------------- #
-# MODIFIED CLASS - This is the fix for the speed calculation          #
-# ------------------------------------------------------------------- #
 class UploadProgressReporter:
     """
     A stateful class to report upload progress by editing a message.
@@ -182,21 +178,16 @@ class UploadProgressReporter:
         self._message = message
         self._file_name = file_name
         self._loop = asyncio.get_event_loop()
-        
-        # Initialize time and bytes from the start
         self._last_update_time = time.time()
         self._last_uploaded_bytes = 0
 
-    # This is a synchronous callback executed by Pyrogram
     def __call__(self, current_bytes, total_bytes):
         current_time = time.time()
         
-        # Throttle updates to every 4 seconds to avoid flood waits
         if current_time - self._last_update_time > 4 or current_bytes == total_bytes:
-            # Calculate speed based on the time elapsed since the last update
             elapsed_time = current_time - self._last_update_time
             if elapsed_time == 0:
-                elapsed_time = 1 # Avoid division by zero
+                elapsed_time = 1
 
             bytes_since_last = current_bytes - self._last_uploaded_bytes
             speed = bytes_since_last / elapsed_time
@@ -221,12 +212,9 @@ class UploadProgressReporter:
         try:
             await self._message.edit_text(text)
         except (FloodWait, MessageNotModified):
-            pass # Ignore these common exceptions
+            pass
         except Exception as e:
             print(f"Error while editing message: {e}")
-# ------------------------------------------------------------------- #
-# End of modified class                                               #
-# ------------------------------------------------------------------- #
 
 async def upload_file(message, file_path):
     """Handles uploading a single file with a detailed progress reporter."""
@@ -258,7 +246,7 @@ async def start(client, message):
 @app.on_message(filters.regex(r"^magnet:.*") & filters.private)
 async def handle_magnet(client, message):
     if message.from_user.id != OWNER_ID: 
-        await message.reply_text("Sorry, you are not authorized to use this bot.")
+        await message.reply_text("**🚫 Sorry, you are not authorized to use this bot.**")
         return
     if message.chat.id in active_torrents:
         await message.reply_text("**⚠️ A download is already active in this chat. Please wait or cancel it first.**")
