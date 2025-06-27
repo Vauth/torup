@@ -8,8 +8,8 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 
 # --- Configuration ---
-API_ID = 8138160  # Replace with your API ID
-API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"  # Replace with your API HASH
+API_ID = 21724  # Replace with your API ID
+API_HASH = "3e0cb5efcd52300aec5994fdfc5bdc16"  # Replace with your API HASH
 BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Use environment variable or hardcode
 OWNER_ID = 5052959324  # Your Telegram user ID
 
