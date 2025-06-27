@@ -15,14 +15,14 @@ DOWNLOAD_PATH = './downloads/'
 # --- Bot Globals & Session Setup ---
 client = TelegramClient('tornet', API_ID, API_HASH)
 
-# State management for pending downloads
+# State management dictionaries
 pending_downloads = {} # {unique_id: magnet_link}
 active_torrents = {}   # {chat_id: (torrent_handle, asyncio.Task)}
 
 # --- Libtorrent Session Optimization ---
 print("Configuring libtorrent session...")
 settings = lt.default_settings()
-settings['user_agent'] = 'Telethon-TorrentBot/1.2 libtorrent/2.0'
+settings['user_agent'] = 'Telethon-TorrentBot/2.0 libtorrent/2.0'
 settings['cache_size'] = 32768
 settings['aio_threads'] = 8
 settings['connections_limit'] = 1000
@@ -49,10 +49,7 @@ def progress_bar_str(progress, length=10):
 # --- Core Logic ---
 
 async def get_torrent_info_task(magnet_link, message):
-    """
-    Fetches torrent metadata.
-    **BUG FIX**: This function now receives the bot's message to edit, not the user's event.
-    """
+    """Fetches torrent metadata and presents it to the user."""
     unique_id = str(uuid.uuid4())[:8]
     try:
         loop = asyncio.get_event_loop()
@@ -67,7 +64,7 @@ async def get_torrent_info_task(magnet_link, message):
                 break
             await asyncio.sleep(1)
         else:
-            await message.edit("❌ **Error:** Timed out while fetching metadata. The torrent is likely dead or has no seeds.")
+            await message.edit("❌ **Error:** Timed out fetching metadata. The torrent is likely dead or has no seeds.")
             await loop.run_in_executor(None, ses.remove_torrent, temp_handle)
             return
 
@@ -118,10 +115,10 @@ async def download_task(chat_id, magnet_link, message):
             status_text = (
                 f"**🚀 Downloading: ** `{ti.name()}`\n\n"
                 f"`{progress_bar_str(s.progress)}` **{s.progress*100:.2f}%**\n\n"
-                f"**⬇️ Speed:** {human_readable_size(s.download_rate)}/s\n"
-                f"**⬆️ Speed:** {human_readable_size(s.upload_rate)}/s\n"
-                f"**📦 Done:** {human_readable_size(s.total_done)} / {human_readable_size(s.total_wanted)}\n"
-                f"**👤 Peers:** {s.num_peers} | **🚦 Status:** {state_str}"
+                f"**⬇️ Speed:** `{human_readable_size(s.download_rate)}/s`\n"
+                f"**⬆️ Speed:** `{human_readable_size(s.upload_rate)}/s`\n"
+                f"**📦 Done:** `{human_readable_size(s.total_done)} / {human_readable_size(s.total_wanted)}`\n"
+                f"**👤 Peers:** `{s.num_peers}` | **🚦 Status:** `{state_str}`"
             )
             buttons = Button.inline("❌ Cancel Download", data=f"cancel_{chat_id}")
             
@@ -142,12 +139,8 @@ async def download_task(chat_id, magnet_link, message):
             file_path = os.path.join(DOWNLOAD_PATH, f.path)
             if os.path.isfile(file_path):
                 await upload_file(chat_id, message, file_path)
-            try:
-                if os.path.isdir(os.path.dirname(file_path)):
-                    os.removedirs(os.path.dirname(file_path))
-            except OSError: pass
 
-        await message.edit("✅ **All files uploaded successfully!**", buttons=None)
+        await message.edit(f"🏁 **Finished!**\n\nAll files from `{ti.name()}` have been successfully uploaded.", buttons=None)
 
     except asyncio.CancelledError:
         await message.edit("❌ **Download Cancelled.**", buttons=None)
@@ -158,40 +151,75 @@ async def download_task(chat_id, magnet_link, message):
         if handle and handle.is_valid():
             await loop.run_in_executor(None, ses.remove_torrent, handle)
 
+class UploadProgressReporter:
+    """A stateful class to report upload progress with speed calculation."""
+    def __init__(self, message, file_name, loop):
+        self._message = message
+        self._file_name = file_name
+        self._loop = loop
+        self._last_update_time = time.time()
+        self._last_uploaded_bytes = 0
+
+    async def __call__(self, current_bytes, total_bytes):
+        current_time = time.time()
+        # Update every 3 seconds to avoid hitting flood limits
+        if current_time - self._last_update_time < 3 and current_bytes != total_bytes:
+            return
+
+        elapsed_time = current_time - self._last_update_time
+        bytes_since_last_update = current_bytes - self._last_uploaded_bytes
+        speed = bytes_since_last_update / elapsed_time if elapsed_time > 0 else 0
+        
+        progress = current_bytes / total_bytes
+        status_text = (
+            f"**📤 Uploading: ** `{self._file_name}`\n\n"
+            f"`{progress_bar_str(progress)}` **{progress*100:.2f}%**\n\n"
+            f"**⬆️ Speed:** `{human_readable_size(speed)}/s`\n"
+            f"**📦 Done:** `{human_readable_size(current_bytes)} / {human_readable_size(total_bytes)}`"
+        )
+
+        try:
+            # **BUG FIX**: Explicitly set buttons=None to prevent old buttons reappearing
+            await self._message.edit(status_text, buttons=None)
+        except Exception:
+            pass
+
+        self._last_update_time = current_time
+        self._last_uploaded_bytes = current_bytes
 
 async def upload_file(chat_id, message, file_path):
-    """Handles uploading a single file with progress callback."""
+    """Handles uploading a single file with a detailed progress reporter."""
     file_name = os.path.basename(file_path)
+    loop = asyncio.get_event_loop()
+    reporter = UploadProgressReporter(message, file_name, loop)
     
-    async def progress_callback(current, total):
-        try:
-            await message.edit(f"**📤 Uploading:** `{file_name}`\n`{progress_bar_str(current/total)}`")
-        except Exception: pass
-
-    await client.send_file(chat_id, file_path, caption=file_name, progress_callback=progress_callback)
+    await client.send_file(
+        chat_id,
+        file_path,
+        caption=file_name,
+        progress_callback=reporter
+    )
     try:
         os.remove(file_path)
-    except OSError as e:
-        print(f"Error removing file {file_path}: {e}")
+        # Clean up empty parent directories
+        if os.path.isdir(os.path.dirname(file_path)):
+            os.removedirs(os.path.dirname(file_path))
+    except OSError:
+        pass # Ignore errors if dir is not empty or doesn't exist
 
 # --- Telegram Event Handlers ---
 
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
-    await event.respond('**Welcome to your Torrent Downloader Bot!**\n\nSend me a magnet link to begin.')
+    await event.respond('**Welcome to your Ultimate Torrent Downloader!**\n\nSend me a magnet link to begin.')
 
 @client.on(events.NewMessage(pattern='magnet:.*'))
 async def handle_magnet(event):
     if event.chat_id in active_torrents:
         await event.respond("A download is already active in this chat. Please wait or cancel it first.")
         return
-    
-    # This is the bot's message that we have permission to edit.
-    bot_message = await event.respond('🔎 **Validating magnet link...**')
-    
-    # **BUG FIX**: Pass the bot's message to the task, not the user's event object.
+    bot_message = await event.respond('⏳ **Validating magnet link...**')
     asyncio.create_task(get_torrent_info_task(event.text, bot_message))
-
 
 @client.on(events.CallbackQuery)
 async def handle_callback(event):
@@ -210,13 +238,14 @@ async def handle_callback(event):
         magnet_link = pending_downloads.pop(unique_id, None)
         
         if not magnet_link:
-            await event.edit("❌ This download link has expired or is invalid. Please send the magnet link again.", buttons=None)
+            await event.edit("❌ This download link has expired. Please send the magnet link again.", buttons=None)
             return
 
         message = await event.get_message()
         if not message: return
 
-        await event.answer("🚀 Starting download...")
+        await event.answer("🚀 Download initiated...")
+        # **BUG FIX**: This edit call reliably removes the "Download" button
         await message.edit("⏳ Initializing download...", buttons=None)
         asyncio.create_task(download_task(chat_id, magnet_link, message))
 
@@ -224,7 +253,7 @@ async def handle_callback(event):
         if chat_id in active_torrents:
             handle, task = active_torrents.pop(chat_id)
             task.cancel()
-            await event.answer("❌ Download cancelled.")
+            await event.answer("❌ Download will be cancelled.", alert=True)
         else:
             await event.answer("This download is not active.", alert=True)
 
