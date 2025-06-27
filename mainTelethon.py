@@ -211,7 +211,13 @@ async def upload_file(chat_id, message, file_path):
 # --- Telegram Event Handlers ---
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
-    await event.respond('**Welcome to your Ultimate Torrent Downloader!**\n\nSend me a magnet link to begin.')
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Dev",url="https://t.me/feelded")],
+            [InlineKeyboardButton("Updates", url="https://t.me/execal")]
+        ]
+    )
+    await event.reply_text('**[⁪⁬⁮⁮⁮⁮](https://i.ibb.co/bR8tDYC5/e838f480e29a.jpg)Welcome to Torrent Uploader!**\n\nSend me a magnet link to begin.', reply_markup=keyboard)
 
 @client.on(events.NewMessage(pattern='magnet:.*'))
 async def handle_magnet(event):
