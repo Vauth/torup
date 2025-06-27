@@ -15,16 +15,14 @@ DOWNLOAD_PATH = './downloads/'
 # --- Bot Globals & Session Setup ---
 client = TelegramClient('tornet', API_ID, API_HASH)
 
-# --- CRITICAL FIX: State management for pending downloads ---
-# This dictionary holds the full magnet link, keyed by a short, unique ID.
-# This avoids passing long magnet links in button data, which was the main bug.
+# State management for pending downloads
 pending_downloads = {} # {unique_id: magnet_link}
 active_torrents = {}   # {chat_id: (torrent_handle, asyncio.Task)}
 
 # --- Libtorrent Session Optimization ---
 print("Configuring libtorrent session...")
 settings = lt.default_settings()
-settings['user_agent'] = 'Telethon-TorrentBot/1.1 libtorrent/2.0'
+settings['user_agent'] = 'Telethon-TorrentBot/1.2 libtorrent/2.0'
 settings['cache_size'] = 32768
 settings['aio_threads'] = 8
 settings['connections_limit'] = 1000
@@ -50,10 +48,12 @@ def progress_bar_str(progress, length=10):
 
 # --- Core Logic ---
 
-async def get_torrent_info_task(magnet_link, event):
-    """Fetches torrent metadata and presents options."""
-    message = event.message
-    unique_id = str(uuid.uuid4())[:8] # Generate a short unique ID
+async def get_torrent_info_task(magnet_link, message):
+    """
+    Fetches torrent metadata.
+    **BUG FIX**: This function now receives the bot's message to edit, not the user's event.
+    """
+    unique_id = str(uuid.uuid4())[:8]
     try:
         loop = asyncio.get_event_loop()
         params = await loop.run_in_executor(None, lt.parse_magnet_uri, magnet_link)
@@ -62,7 +62,6 @@ async def get_torrent_info_task(magnet_link, event):
 
         await message.edit('🔎 Fetching torrent details... (This can take a moment)')
 
-        # Wait for metadata
         for _ in range(60): # Timeout after ~60 seconds
             if await loop.run_in_executor(None, temp_handle.has_metadata):
                 break
@@ -87,7 +86,6 @@ async def get_torrent_info_task(magnet_link, event):
             f"**📦 Files:**\n{file_list}"
         )
         
-        # Store the magnet link with the unique ID and use the ID in the button
         pending_downloads[unique_id] = magnet_link
         buttons = Button.inline("🚀 Download", data=f"start_{unique_id}")
         await message.edit(details_text, buttons=buttons)
@@ -187,8 +185,13 @@ async def handle_magnet(event):
     if event.chat_id in active_torrents:
         await event.respond("A download is already active in this chat. Please wait or cancel it first.")
         return
-    message = await event.respond('🔎 **Validating magnet link...**')
-    asyncio.create_task(get_torrent_info_task(event.text, event))
+    
+    # This is the bot's message that we have permission to edit.
+    bot_message = await event.respond('🔎 **Validating magnet link...**')
+    
+    # **BUG FIX**: Pass the bot's message to the task, not the user's event object.
+    asyncio.create_task(get_torrent_info_task(event.text, bot_message))
+
 
 @client.on(events.CallbackQuery)
 async def handle_callback(event):
