@@ -157,14 +157,14 @@ async def download_task(chat_id, magnet_link, message):
                 )
 
                 # The reporter will now edit the message with detailed progress.
-                reporter = await UploadProgressReporter(message, file_name)
+                reporter = UploadProgressReporter(message, file_name)
 
                 await app.send_document(
                     chat_id=message.chat.id,
                     document=file_path,
                     caption=f"`{file_name}`",
                     force_document=True,
-                    progress=reporter
+                    progress=await reporter
                 )
 
                 # Clean up the file after successful upload
@@ -232,14 +232,14 @@ async def upload_file(message, file_path):
     """Handles uploading a single file with a detailed progress reporter."""
     file_name = os.path.basename(file_path)
     # The reporter will edit the 'message' object it's given.
-    reporter = await UploadProgressReporter(message, file_name)
+    reporter = UploadProgressReporter(message, file_name)
 
     await app.send_document(
         chat_id=message.chat.id,
         document=file_path,
         caption=f"`{file_name}`",
         force_document=True,
-        progress=reporter
+        progress=await reporter
     )
     try:
         os.remove(file_path)
