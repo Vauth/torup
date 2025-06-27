@@ -1,12 +1,13 @@
-import asyncio
 import os
 import time
 import uuid
+import asyncio
 import libtorrent as lt
 from telethon import TelegramClient, events, Button
 
 # --- Configuration ---
 API_ID = 8138160
+OWNER_ID = 5052959324
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -47,7 +48,6 @@ def progress_bar_str(progress, length=10):
     return '▰' * filled_len + '▱' * (length - filled_len)
 
 # --- Core Logic ---
-
 async def get_torrent_info_task(magnet_link, message):
     """Fetches torrent metadata and presents it to the user."""
     unique_id = str(uuid.uuid4())[:8]
@@ -162,8 +162,8 @@ class UploadProgressReporter:
 
     async def __call__(self, current_bytes, total_bytes):
         current_time = time.time()
-        # Update every 3 seconds to avoid hitting flood limits
-        if current_time - self._last_update_time < 3 and current_bytes != total_bytes:
+        # Update every 5 seconds to avoid hitting flood limits
+        if current_time - self._last_update_time < 5 and current_bytes != total_bytes:
             return
 
         elapsed_time = current_time - self._last_update_time
@@ -197,6 +197,7 @@ async def upload_file(chat_id, message, file_path):
         chat_id,
         file_path,
         caption=file_name,
+        force_document=True,
         progress_callback=reporter
     )
     try:
@@ -205,16 +206,16 @@ async def upload_file(chat_id, message, file_path):
         if os.path.isdir(os.path.dirname(file_path)):
             os.removedirs(os.path.dirname(file_path))
     except OSError:
-        pass # Ignore errors if dir is not empty or doesn't exist
+        pass
 
 # --- Telegram Event Handlers ---
-
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
     await event.respond('**Welcome to your Ultimate Torrent Downloader!**\n\nSend me a magnet link to begin.')
 
 @client.on(events.NewMessage(pattern='magnet:.*'))
 async def handle_magnet(event):
+    if event.sender.id != OWNER_ID: return
     if event.chat_id in active_torrents:
         await event.respond("**⚠️ A download is already active in this chat. Please wait or cancel it first.**")
         return
@@ -245,7 +246,6 @@ async def handle_callback(event):
         if not message: return
 
         await event.answer("**🚀 Download initiated...**")
-        # **BUG FIX**: This edit call reliably removes the "Download" button
         await message.edit("**⏳ Initializing download...**", buttons=None)
         asyncio.create_task(download_task(chat_id, magnet_link, message))
 
