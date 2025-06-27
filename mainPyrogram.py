@@ -232,7 +232,7 @@ async def upload_file(message, file_path):
     """Handles uploading a single file with a detailed progress reporter."""
     file_name = os.path.basename(file_path)
     # The reporter will edit the 'message' object it's given.
-    reporter = UploadProgressReporter(message, file_name)
+    reporter = await UploadProgressReporter(message, file_name)
 
     await app.send_document(
         chat_id=message.chat.id,
