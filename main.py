@@ -293,13 +293,17 @@ def delete_torrent_files(torrent_info):
 # --- Telegram Event Handlers ---
 @app.on_message(filters.command("start"))
 async def start(client, message):
+    user_name = message.from_user.first_name
+    user_id = message.from_user.id
+    mention = f"[{user_name}](tg://user?id={user_id})"
+    
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Dev",url="https://t.me/feelded")],
             [InlineKeyboardButton("Updates", url="https://t.me/execal")]
         ]
     )
-    await message.reply_text('**[⁪⁬⁮⁮⁮⁮](https://i.ibb.co/bR8tDYC5/e838f480e29a.jpg)Welcome to Torrent Uploader!**\n\nSend me a magnet link to begin.', reply_markup=keyboard)
+    await message.reply_text(f'[⁪⁬⁮⁮⁮⁮](https://i.ibb.co/bR8tDYC5/e838f480e29a.jpg)Hi {mention} !\nI am a torrent uploader.\nSend me a magnet link to begin.', reply_markup=keyboard)
 
 
 @app.on_message(filters.regex(r"^magnet:.*"))
