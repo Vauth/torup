@@ -106,4 +106,96 @@ async def download_manager(event, magnet_link):
         await message.edit("**All files uploaded successfully!**")
 
     except lt.libtorrent_error as e:
-        await message.edit(f"**
+        await message.edit(f"**Torrent Error:** {e}")
+    except Exception as e:
+        await message.edit(f"**An unexpected error occurred:** {e}")
+    finally:
+        # --- Cleanup ---
+        if chat_id in active_torrents:
+            handle_to_remove, _ = active_torrents.pop(chat_id)
+            await loop.run_in_executor(
+                None, lambda: ses.remove_torrent(handle_to_remove) if handle_to_remove.is_valid() else None
+            )
+
+
+async def upload_file(chat_id, message, file_path):
+    """Handles uploading a single file with progress callback."""
+    file_name = os.path.basename(file_path)
+
+    async def progress_callback(current, total):
+        percentage = current / total
+        bar = progress_bar_str(percentage)
+        await message.edit(
+            f"**Uploading:** `{file_name}`\n"
+            f"`{bar}` {percentage:.2%}"
+        )
+
+    await client.send_file(
+        chat_id,
+        file_path,
+        caption=file_name,
+        attributes=[DocumentAttributeFilename(file_name)],
+        progress_callback=progress_callback
+    )
+
+
+# --- Telegram Bot Event Handlers ---
+@client.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    await event.respond(
+        '**Welcome to the Torrent Downloader Bot!**\n\n'
+        'Send me a magnet link to start a download. '
+        'Features:\n'
+        '- Real-time progress updates\n'
+        '- Cancellation support with /cancel\n'
+        '- Automatic upload to Telegram'
+    )
+
+
+@client.on(events.NewMessage(pattern='magnet:.*'))
+async def handle_magnet(event):
+    chat_id = event.chat_id
+    if chat_id in active_torrents:
+        await event.respond("A download is already active in this chat. Please /cancel it or wait for it to complete.")
+        return
+
+    magnet_link = event.text
+    # Start the download manager in the background
+    asyncio.create_task(download_manager(event, magnet_link))
+
+
+@client.on(events.NewMessage(pattern='/cancel'))
+async def cancel_download(event):
+    chat_id = event.chat_id
+    loop = asyncio.get_event_loop()
+
+    if chat_id in active_torrents:
+        handle, message = active_torrents.pop(chat_id)
+        # Run the blocking remove call in the executor
+        await loop.run_in_executor(None, ses.remove_torrent, handle)
+        await message.edit("**Download has been cancelled.**")
+    else:
+        await event.respond("No active download to cancel.")
+
+
+# --- Main Function ---
+async def main():
+    """Main function to start the bot and libtorrent session."""
+    if not os.path.exists(DOWNLOAD_PATH):
+        os.makedirs(DOWNLOAD_PATH)
+
+    print("Bot is starting...")
+    await client.start(bot_token=BOT_TOKEN)
+    print("Bot has started successfully.")
+    await client.run_until_disconnected()
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nBot stopped by user.")
+    finally:
+        # Cleanly shut down the libtorrent session if needed, though it's
+        # often handled automatically on process exit.
+        del ses
