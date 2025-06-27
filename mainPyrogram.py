@@ -8,15 +8,21 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 
 # --- Configuration ---
-API_ID = 8138160
-OWNER_ID = 5052959324
-API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+API_ID = 8138160  # Replace with your API ID
+API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"  # Replace with your API HASH
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Use environment variable or hardcode
+OWNER_ID = 5052959324  # Your Telegram user ID
 
 DOWNLOAD_PATH = './downloads/'
 
 # --- Bot Setup ---
-app = Client("tornet", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    "tornet",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    parse_mode=ParseMode.MARKDOWN
+)
 
 # State management dictionaries
 pending_downloads = {}  # {unique_id: magnet_link}
@@ -24,40 +30,39 @@ active_torrents = {}  # {chat_id: (torrent_handle, asyncio.Task)}
 
 # --- Libtorrent Session Optimization ---
 print("Configuring libtorrent session...")
-settings = lt.default_settings()
-settings['user_agent'] = 'Pyrogram-TorrentBot/2.0 libtorrent/2.0'
-settings['cache_size'] = 32768
-settings['aio_threads'] = 8
-settings['connections_limit'] = 1000
-settings['alert_mask'] = (
+settings = {
+    'user_agent': 'Pyrogram-TorrentBot/2.0 libtorrent/2.0',
+    'cache_size': 32768,
+    'aio_threads': 8,
+    'connections_limit': 1000,
+    'alert_mask': (
         lt.alert.category_t.error_notification |
         lt.alert.category_t.storage_notification |
         lt.alert.category_t.status_notification
-)
+    ),
+}
 ses = lt.session(settings)
 ses.listen_on(6881, 6891)
 print("Session configured.")
 
-
 # --- Helper Functions ---
 def human_readable_size(size, decimal_places=2):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size < 1024.0: break
+        if size < 1024.0:
+            break
         size /= 1024.0
     return f"{size:.{decimal_places}f} {unit}"
-
 
 def progress_bar_str(progress, length=10):
     filled_len = int(length * progress)
     return '▰' * filled_len + '▱' * (length - filled_len)
-
 
 # --- Core Logic ---
 async def get_torrent_info_task(magnet_link: str, message: Message):
     """Fetches torrent metadata and presents it to the user."""
     unique_id = str(uuid.uuid4())[:8]
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         params = await loop.run_in_executor(None, lt.parse_magnet_uri, magnet_link)
         params.save_path = DOWNLOAD_PATH
         temp_handle = await loop.run_in_executor(None, ses.add_torrent, params)
@@ -94,15 +99,12 @@ async def get_torrent_info_task(magnet_link: str, message: Message):
         ])
         await message.edit_text(details_text, reply_markup=buttons)
 
-    except RuntimeError as e:
-        await message.edit_text(f"❌ **Error:** Invalid magnet link or metadata fetch failed.\n\n`{e}`")
     except Exception as e:
-        await message.edit_text(f"❌ **An unexpected critical error occurred:**\n`{e}`")
-
+        await message.edit_text(f"❌ **Error:** {str(e)}")
 
 async def download_task(chat_id: int, magnet_link: str, message: Message):
     """The main task that handles the download and progress updates."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     handle = None
     try:
         params = await loop.run_in_executor(None, lt.parse_magnet_uri, magnet_link)
@@ -115,28 +117,32 @@ async def download_task(chat_id: int, magnet_link: str, message: Message):
             await asyncio.sleep(0.5)
         ti = await loop.run_in_executor(None, handle.get_torrent_info)
 
+        last_update_time = time.time()
         while handle.is_valid() and handle.status().state != lt.torrent_status.seeding:
             s = handle.status()
-            state_str = ['Queued', 'Checking', 'DL Metadata', 'Downloading', 'Finished', 'Seeding', 'Allocating'][
-                s.state]
+            state_str = ['Queued', 'Checking', 'DL Metadata', 'Downloading', 'Finished', 'Seeding', 'Allocating'][s.state]
 
-            status_text = (
-                f"**🚀 Downloading: ** `{ti.name()}`\n\n"
-                f"{progress_bar_str(s.progress)} **{s.progress * 100:.2f}%**\n\n"
-                f"**⬇️ Speed:** `{human_readable_size(s.download_rate)}/s`\n"
-                f"**⬆️ Speed:** `{human_readable_size(s.upload_rate)}/s`\n"
-                f"**📦 Done:** `{human_readable_size(s.total_done)} / {human_readable_size(s.total_wanted)}`\n"
-                f"**👤 Peers:** `{s.num_peers}` | **🚦 Status:** `{state_str}`"
-            )
-            buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{chat_id}")]
-            ])
+            # Only update every 5 seconds to avoid flooding
+            if time.time() - last_update_time >= 5:
+                status_text = (
+                    f"**🚀 Downloading: ** `{ti.name()}`\n\n"
+                    f"{progress_bar_str(s.progress)} **{s.progress * 100:.2f}%**\n\n"
+                    f"**⬇️ Speed:** `{human_readable_size(s.download_rate)}/s`\n"
+                    f"**⬆️ Speed:** `{human_readable_size(s.upload_rate)}/s`\n"
+                    f"**📦 Done:** `{human_readable_size(s.total_done)} / {human_readable_size(s.total_wanted)}`\n"
+                    f"**👤 Peers:** `{s.num_peers}` | **🚦 Status:** `{state_str}`"
+                )
+                buttons = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel_{chat_id}")]
+                ])
 
-            try:
-                await message.edit_text(status_text, reply_markup=buttons)
-            except Exception:
-                break
-            await asyncio.sleep(5)
+                try:
+                    await message.edit_text(status_text, reply_markup=buttons)
+                    last_update_time = time.time()
+                except Exception as e:
+                    print(f"Error updating status: {e}")
+
+            await asyncio.sleep(1)
 
         if not (handle.is_valid() and handle.status().state == lt.torrent_status.seeding):
             if not asyncio.current_task().cancelled():
@@ -159,135 +165,111 @@ async def download_task(chat_id: int, magnet_link: str, message: Message):
     except asyncio.CancelledError:
         await message.edit_text("❌ **Download Cancelled.**", reply_markup=None)
     except Exception as e:
-        await message.edit_text(f"❌ **An unexpected error occurred during download:**\n`{e}`", reply_markup=None)
+        await message.edit_text(f"❌ **Error during download:** {str(e)}", reply_markup=None)
     finally:
-        if chat_id in active_torrents: del active_torrents[chat_id]
+        if chat_id in active_torrents:
+            del active_torrents[chat_id]
         if handle and handle.is_valid():
             await loop.run_in_executor(None, ses.remove_torrent, handle)
 
-
-class UploadProgressReporter:
-    """A stateful class to report upload progress with speed calculation."""
-
-    def __init__(self, message: Message, file_name: str, loop):
-        self._message = message
-        self._file_name = file_name
-        self._loop = loop
-        self._last_update_time = time.time()
-        self._last_uploaded_bytes = 0
-
-    async def __call__(self, current_bytes: int, total_bytes: int):
-        current_time = time.time()
-        # Update every 5 seconds to avoid hitting flood limits
-        if current_time - self._last_update_time < 5 and current_bytes != total_bytes:
+async def upload_file(chat_id: int, message: Message, file_path: str):
+    """Handles uploading a single file with progress updates."""
+    file_name = os.path.basename(file_path)
+    last_update_time = 0
+    
+    async def progress(current, total):
+        nonlocal last_update_time
+        now = time.time()
+        if now - last_update_time < 5 and current != total:
             return
-
-        elapsed_time = current_time - self._last_update_time
-        bytes_since_last_update = current_bytes - self._last_uploaded_bytes
-        speed = bytes_since_last_update / elapsed_time if elapsed_time > 0 else 0
-
-        progress = current_bytes / total_bytes
+        
+        progress_percent = (current / total) * 100
+        speed = (current / (now - last_update_time)) if now > last_update_time else 0
+        
         status_text = (
-            f"**📤 Uploading: ** `{self._file_name}`\n\n"
-            f"{progress_bar_str(progress)} **{progress * 100:.2f}%**\n\n"
+            f"**📤 Uploading: ** `{file_name}`\n\n"
+            f"{progress_bar_str(current/total)} **{progress_percent:.2f}%**\n\n"
             f"**⬆️ Speed:** `{human_readable_size(speed)}/s`\n"
-            f"**📦 Done:** `{human_readable_size(current_bytes)} / {human_readable_size(total_bytes)}`"
+            f"**📦 Done:** `{human_readable_size(current)} / {human_readable_size(total)}`"
         )
-
+        
         try:
-            await self._message.edit_text(status_text, reply_markup=None)
+            await message.edit_text(status_text)
+            last_update_time = now
         except Exception:
             pass
 
-        self._last_update_time = current_time
-        self._last_uploaded_bytes = current_bytes
-
-
-async def upload_file(chat_id: int, message: Message, file_path: str):
-    """Handles uploading a single file with a detailed progress reporter."""
-    file_name = os.path.basename(file_path)
-    loop = asyncio.get_event_loop()
-    reporter = UploadProgressReporter(message, file_name, loop)
-
-    await app.send_document(
-        chat_id=chat_id,
-        document=file_path,
-        caption=file_name,
-        force_document=True,
-        progress=reporter
-    )
     try:
-        os.remove(file_path)
-        # Clean up empty parent directories
-        if os.path.isdir(os.path.dirname(file_path)):
-            os.removedirs(os.path.dirname(file_path))
-    except OSError:
-        pass
-
+        await app.send_document(
+            chat_id=chat_id,
+            document=file_path,
+            caption=file_name,
+            force_document=True,
+            progress=progress
+        )
+    except Exception as e:
+        await message.edit_text(f"❌ **Upload failed:** {str(e)}")
+    finally:
+        try:
+            os.remove(file_path)
+            dir_path = os.path.dirname(file_path)
+            if os.path.isdir(dir_path) and not os.listdir(dir_path):
+                os.rmdir(dir_path)
+        except OSError:
+            pass
 
 # --- Telegram Event Handlers ---
-@app.on_message(filters.command("start"))
-async def start(client, message: Message):
-    print('start jus has been clicked')
-    await message.reply_text('**Welcome to your Ultimate Torrent Downloader!**\n\nSend me a magnet link to begin.')
+@app.on_message(filters.command("start") & filters.private)
+async def start_command(client, message: Message):
+    await message.reply_text(
+        '**Welcome to your Ultimate Torrent Downloader!**\n\n'
+        'Send me a magnet link to begin.'
+    )
 
-
-@app.on_message(filters.regex(r'^magnet:'))
+@app.on_message(filters.regex(r'^magnet:\?') & filters.user(OWNER_ID))
 async def handle_magnet(client, message: Message):
-    if message.from_user.id != OWNER_ID: return
     if message.chat.id in active_torrents:
         await message.reply_text("**⚠️ A download is already active in this chat. Please wait or cancel it first.**")
         return
+    
     bot_message = await message.reply_text('⏳ **Validating magnet link...**')
     asyncio.create_task(get_torrent_info_task(message.text, bot_message))
 
-
-@app.on_callback_query()
+@app.on_callback_query(filters.regex(r'^start_') | filters.regex(r'^cancel_'))
 async def handle_callback(client, callback_query):
-    """Handles all button clicks."""
-    data_parts = callback_query.data.split('_', 1)
-    action, payload = data_parts[0], data_parts[1] if len(data_parts) > 1 else None
-
+    data = callback_query.data
     chat_id = callback_query.message.chat.id
-
-    if action == "start":
-        if chat_id in active_torrents:
-            await callback_query.answer("Another download is already active!", show_alert=True)
-            return
-
-        unique_id = payload
+    
+    if data.startswith("start_"):
+        unique_id = data.split('_')[1]
         magnet_link = pending_downloads.pop(unique_id, None)
-
+        
         if not magnet_link:
-            await callback_query.message.edit_text(
+            await callback_query.answer("This download link has expired!", show_alert=True)
+            return await callback_query.message.edit_text(
                 "**❌ This download link has expired. Please send the magnet link again.**",
                 reply_markup=None
             )
-            return
-
-        message = callback_query.message
-        if not message: return
-
-        await callback_query.answer("**🚀 Download initiated...**")
-        await message.edit_text("**⏳ Initializing download...**", reply_markup=None)
-        asyncio.create_task(download_task(chat_id, magnet_link, message))
-
-    elif action == "cancel":
-        if chat_id in active_torrents:
-            handle, task = active_torrents.pop(chat_id)
+        
+        await callback_query.answer("Download starting...")
+        await callback_query.message.edit_text("**⏳ Initializing download...**", reply_markup=None)
+        asyncio.create_task(download_task(chat_id, magnet_link, callback_query.message))
+        
+    elif data.startswith("cancel_"):
+        target_chat_id = int(data.split('_')[1])
+        if target_chat_id in active_torrents:
+            handle, task = active_torrents.pop(target_chat_id)
             task.cancel()
-            await callback_query.answer("**❌ Download will be cancelled.**", show_alert=True)
+            await callback_query.answer("Download cancelled!", show_alert=True)
         else:
-            await callback_query.answer("**⚠️ This download is not active.**", show_alert=True)
-
+            await callback_query.answer("No active download to cancel!", show_alert=True)
 
 # --- Alert Handler & Main Function ---
 async def alert_handler():
     """A background task that prints session alerts for debugging."""
-    loop = asyncio.get_event_loop()
     while True:
         try:
-            alerts = await loop.run_in_executor(None, ses.pop_alerts)
+            alerts = ses.pop_alerts()
             for alert in alerts:
                 if alert.what() and alert.message():
                     print(f"[{alert.what()}] {alert.message()}")
@@ -295,25 +277,26 @@ async def alert_handler():
         except Exception as e:
             print(f"Alert handler error: {e}")
 
-
-async def main():
+async def run_bot():
     if not BOT_TOKEN:
-        print("FATAL: BOT_TOKEN environment variable not set.")
+        print("Error: BOT_TOKEN not set!")
         return
-
-    if not os.path.exists(DOWNLOAD_PATH): os.makedirs(DOWNLOAD_PATH)
-
-    print("Bot is starting...")
-    await app.start()
     
-    asyncio.create_task(alert_handler())
-
-    print("Bot has started successfully. Listening for magnet links...")
-    await asyncio.Event().wait()  # Run forever
-
+    if not os.path.exists(DOWNLOAD_PATH):
+        os.makedirs(DOWNLOAD_PATH)
+    
+    print("Starting bot...")
+    async with app:
+        # Start background tasks
+        asyncio.create_task(alert_handler())
+        
+        print("Bot is running!")
+        await asyncio.Event().wait()  # Run forever
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        print("Bot stopped by user")
     except Exception as e:
-        print(f"A critical error occurred in main: {e}")
+        print(f"Fatal error: {e}")
