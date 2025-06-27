@@ -8,7 +8,7 @@ from telethon import TelegramClient, events, Button
 # Your API credentials and bot token
 API_ID = 8138160
 API_HASH = "1ad2dae5b9fddc7fe7bfee2db9d54ff2"
-BOT_TOKEN = os.environ.get("BOT_TOKEN") # It's best practice to get this from an environment variable
+BOT_TOKEN = os.environ.get("BOT_TOKEN") # Best practice: get from an environment variable
 
 # Path where downloaded files will be stored
 DOWNLOAD_PATH = './downloads/'
@@ -17,28 +17,23 @@ DOWNLOAD_PATH = './downloads/'
 client = TelegramClient('tornet', API_ID, API_HASH)
 
 # In-memory dictionaries for state management
-pending_torrents = {} # {message_id: magnet_link}
-active_torrents = {}  # {chat_id: (torrent_handle, task)}
+# { message_id: asyncio.Task }
+cancellable_tasks = {}
+# { chat_id: (torrent_handle, asyncio.Task) }
+active_torrents = {}
 
 # --- Libtorrent Session Optimization for Speed ---
 print("Configuring libtorrent session for maximum speed...")
 settings = lt.default_settings()
-settings['user_agent'] = 'libtorrent/2.0'
-settings['cache_size'] = 32768  # 512 MB cache size (32768 * 16KiB blocks)
-settings['peer_connect_timeout'] = 10
-settings['request_timeout'] = 20
-settings['stop_tracker_timeout'] = 5
-settings['aio_threads'] = 8 # More threads for disk I/O
-settings['checking_mem_usage'] = 2048 # Use more RAM for checking files
-settings['connections_limit'] = 1000 # Increase connection limit
-# Set alert_mask for advanced error handling
+settings['user_agent'] = 'Telethon-TorrentBot/1.0 libtorrent/2.0'
+settings['cache_size'] = 32768  # 512 MB cache
+settings['aio_threads'] = 8
+settings['connections_limit'] = 1000
 settings['alert_mask'] = (
     lt.alert.category_t.error_notification |
     lt.alert.category_t.storage_notification |
-    lt.alert.category_t.tracker_notification |
     lt.alert.category_t.status_notification
 )
-
 ses = lt.session(settings)
 ses.listen_on(6881, 6891)
 print("Session configured.")
@@ -56,34 +51,47 @@ def progress_bar_str(progress, length=10):
 
 # --- Core Logic ---
 
-async def get_torrent_info_from_magnet(magnet_link, message):
-    """Fetches metadata from a magnet link without starting the download."""
-    loop = asyncio.get_event_loop()
+async def get_torrent_info_task(magnet_link, event):
+    """Cancellable task to fetch torrent metadata and present options."""
+    message = event.message
     try:
-        # **BUG FIX**: Correctly call parse_magnet_uri and then modify the resulting params object.
+        loop = asyncio.get_event_loop()
         params = await loop.run_in_executor(None, lt.parse_magnet_uri, magnet_link)
         params.save_path = DOWNLOAD_PATH
-        
         temp_handle = await loop.run_in_executor(None, ses.add_torrent, params)
 
-        await message.edit('🔎 Fetching torrent details... (This can take a moment for poorly seeded torrents)')
         while not await loop.run_in_executor(None, temp_handle.has_metadata):
             await asyncio.sleep(1)
 
         ti = await loop.run_in_executor(None, temp_handle.get_torrent_info)
         await loop.run_in_executor(None, ses.remove_torrent, temp_handle)
-        return ti
-    except RuntimeError as e:
-        error_message = str(e)
-        if "invalid magnet uri" in error_message or "could not parse" in error_message:
-             await message.edit(f"**Error:** The provided magnet link appears to be invalid.\n\n`{error_message}`")
-        else:
-             await message.edit(f"**Error fetching metadata:**\n`{error_message}`")
-        return None
-    except Exception as e:
-        await message.edit(f"**An unexpected critical error occurred:**\n`{e}`")
-        return None
 
+        # **DEPRECATION FIX**: Use ti.num_files() and ti.file_at(i)
+        files = [ti.file_at(i) for i in range(ti.num_files())]
+        file_list = "\n".join(
+            [f"📄 `{f.path}` ({human_readable_size(f.size)})" for f in files]
+        )
+        if len(file_list) > 2048: # Truncate if too long
+            file_list = file_list[:2048] + "\n..."
+
+        details_text = (
+            f"✅ **Torrent Details Ready**\n\n"
+            f"**🏷️ Name:** `{ti.name()}`\n"
+            f"**🗂️ Size:** {human_readable_size(ti.total_size())}\n\n"
+            f"**📦 Files:**\n{file_list}"
+        )
+        
+        # Pass magnet link in the button data to avoid global dicts
+        buttons = Button.inline("🚀 Download", data=f"start_{magnet_link}")
+        await message.edit(details_text, buttons=buttons)
+
+    except asyncio.CancelledError:
+        await message.edit("❌ **Fetch Cancelled.**")
+    except RuntimeError as e:
+        await message.edit(f"❌ **Error:** Invalid magnet link or metadata fetch failed.\n\n`{e}`")
+    finally:
+        if message.id in cancellable_tasks:
+            del cancellable_tasks[message.id]
 
 async def download_task(chat_id, magnet_link, message):
     """The main task that handles the download and progress updates."""
@@ -94,46 +102,56 @@ async def download_task(chat_id, magnet_link, message):
         handle = await loop.run_in_executor(None, ses.add_torrent, params)
         
         active_torrents[chat_id] = (handle, asyncio.current_task())
+        
+        # Wait for metadata to be ready before starting the main loop
+        while not await loop.run_in_executor(None, handle.has_metadata):
+            await asyncio.sleep(0.5)
         ti = await loop.run_in_executor(None, handle.get_torrent_info)
 
-        while not await loop.run_in_executor(None, handle.status):
+        while handle.is_valid() and not await loop.run_in_executor(None, lambda: handle.status().state == lt.torrent_status.seeding):
             s = await loop.run_in_executor(None, handle.status)
-            if s.state == lt.torrent_status.seeding:
-                break
-            
-            state_str = ['queued', 'checking', 'downloading metadata', 'downloading', 'finished', 'seeding', 'allocating'][s.state]
-            progress = s.progress * 100
-            bar = progress_bar_str(s.progress)
+            state_str = ['Queued', 'Checking', 'DL Metadata', 'Downloading', 'Finished', 'Seeding', 'Allocating'][s.state]
             
             status_text = (
-                f"**Downloading:** `{ti.name()}`\n"
-                f"**[{bar}]** {progress:.2f}%\n\n"
-                f"**Speed:** ⬇️ {human_readable_size(s.download_rate)}/s | ⬆️ {human_readable_size(s.upload_rate)}/s\n"
-                f"**Size:** {human_readable_size(s.total_done)} / {human_readable_size(s.total_wanted)}\n"
-                f"**Peers:** {s.num_peers} | **State:** {state_str}"
+                f"**🚀 Downloading: ** `{ti.name()}`\n\n"
+                f"`{progress_bar_str(s.progress)}` **{s.progress*100:.2f}%**\n\n"
+                f"**⬇️ Speed:** {human_readable_size(s.download_rate)}/s\n"
+                f"**⬆️ Speed:** {human_readable_size(s.upload_rate)}/s\n"
+                f"**📦 Done:** {human_readable_size(s.total_done)} / {human_readable_size(s.total_wanted)}\n"
+                f"**👤 Peers:** {s.num_peers} | **🚦 Status:** {state_str}"
             )
-            
-            buttons = Button.inline("Cancel", data=f"cancel_{chat_id}")
+            buttons = Button.inline("❌ Cancel Download", data=f"cancel_{chat_id}")
             
             try:
                 await message.edit(status_text, buttons=buttons)
             except Exception: break
-            await asyncio.sleep(4)
+            await asyncio.sleep(5)
 
-        await message.edit(f"✅ **Download complete!**\n`{ti.name()}`\n\nNow uploading files...", buttons=None)
+        if not handle.is_valid():
+             await message.edit("❌ **Download Cancelled or Invalidated.**", buttons=None)
+             return
 
-        files = sorted(await loop.run_in_executor(None, ti.files), key=lambda f: f.path)
+        await message.edit(f"✅ **Download complete!**\n`{ti.name()}`\n\n📤 Preparing to upload...", buttons=None)
+
+        # **DEPRECATION FIX**: Use modern file iteration
+        files = sorted([ti.file_at(i) for i in range(ti.num_files())], key=lambda f: f.path)
         for f in files:
             file_path = os.path.join(DOWNLOAD_PATH, f.path)
             if os.path.isfile(file_path):
                 await upload_file(chat_id, message, file_path)
+            # Clean up empty directories after upload
+            try:
+                if os.path.isdir(os.path.dirname(file_path)):
+                    os.removedirs(os.path.dirname(file_path))
+            except OSError:
+                pass # Directory not empty, which is fine
 
-        await message.edit("**All files uploaded successfully!**", buttons=None)
+        await message.edit("✅ **All files uploaded successfully!**", buttons=None)
 
     except asyncio.CancelledError:
-        await message.edit("**Download cancelled by user.**", buttons=None)
+        await message.edit("❌ **Download Cancelled.**", buttons=None)
     except Exception as e:
-        await message.edit(f"**An unexpected error occurred during download:**\n`{e}`", buttons=None)
+        await message.edit(f"❌ **An unexpected error occurred:**\n`{e}`", buttons=None)
     finally:
         if chat_id in active_torrents:
             del active_torrents[chat_id]
@@ -144,9 +162,11 @@ async def upload_file(chat_id, message, file_path):
     file_name = os.path.basename(file_path)
     
     async def progress_callback(current, total):
-        bar = progress_bar_str(current / total)
         try:
-            await message.edit(f"**Uploading:** `{file_name}`\n`{bar}`")
+            await message.edit(
+                f"**📤 Uploading:** `{file_name}`\n"
+                f"`{progress_bar_str(current/total)}`"
+            )
         except Exception: pass
 
     await client.send_file(chat_id, file_path, caption=file_name, progress_callback=progress_callback)
@@ -159,55 +179,47 @@ async def upload_file(chat_id, message, file_path):
 
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
-    await event.respond('**Welcome!**\nSend me a magnet link to begin.')
+    await event.respond('**Welcome to your Torrent Downloader Bot!**\n\nSend me a magnet link to begin.')
 
 @client.on(events.NewMessage(pattern='magnet:.*'))
 async def handle_magnet(event):
-    chat_id = event.chat_id
-    if chat_id in active_torrents:
-        await event.respond("A download is already active in this chat. Please cancel it before starting a new one.", parse_mode='md')
+    if event.chat_id in active_torrents:
+        await event.respond("A download is already active in this chat. Please wait or cancel it first.", parse_mode='md')
         return
 
-    message = await event.respond('Validating magnet link...')
-    magnet_link = event.text
-    
-    ti = await get_torrent_info_from_magnet(magnet_link, message)
-    if ti is None: return
-
-    pending_torrents[message.id] = magnet_link
-
-    file_list = "\n".join([f"• `{f.path}` ({human_readable_size(f.size)})" for f in ti.files()])
-    details_text = (
-        f"**Torrent Details:**\n\n"
-        f"**Name:** `{ti.name()}`\n"
-        f"**Size:** {human_readable_size(ti.total_size())}\n\n"
-        f"**Files:**\n{file_list}"
+    message = await event.respond(
+        '🔎 **Fetching torrent details...**',
+        buttons=Button.inline("❌ Cancel", data=f"cancel_fetch_{event.message.id}")
     )
-
-    buttons = Button.inline("🚀 Download", data=f"start_{message.id}")
-    await message.edit(details_text, buttons=buttons)
+    
+    task = asyncio.create_task(get_torrent_info_task(event.text, event))
+    cancellable_tasks[message.id] = task
 
 @client.on(events.CallbackQuery)
 async def handle_callback(event):
     """Handles all button clicks."""
-    data = event.data.decode('utf-8')
+    data_parts = event.data.decode('utf-8').split('_', 1)
+    action = data_parts[0]
+    payload = data_parts[1] if len(data_parts) > 1 else None
+    
     chat_id = event.chat_id
     message_id = event.message_id
-    
-    if data.startswith('start_'):
+
+    if action == "start":
         if chat_id in active_torrents:
-            await event.answer("Another download is already active in this chat!", alert=True)
+            await event.answer("Another download is already active!", alert=True)
             return
+        
+        magnet_link = payload
+        # **ATTRIBUTEERROR FIX**: Use `await event.get_message()`
+        message = await event.get_message()
+        if not message: return
 
-        magnet_link = pending_torrents.pop(message_id, None)
-        if not magnet_link:
-            await event.edit("This download link has expired or is invalid.", buttons=None)
-            return
+        await event.answer("🚀 Starting download...")
+        await message.edit("⏳ Initializing download...", buttons=None)
+        asyncio.create_task(download_task(chat_id, magnet_link, message))
 
-        await event.edit("Starting download...", buttons=None)
-        asyncio.create_task(download_task(chat_id, magnet_link, event.message))
-
-    elif data.startswith('cancel_'):
+    elif action == "cancel":
         if chat_id in active_torrents:
             handle, task = active_torrents.pop(chat_id)
             task.cancel()
@@ -215,11 +227,18 @@ async def handle_callback(event):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: ses.remove_torrent(handle, lt.session.delete_files) if handle.is_valid() else None)
             
-            await event.answer("Download cancelled.")
+            await event.answer("❌ Download cancelled.")
         else:
-            await event.answer("This download is already completed or cancelled.", alert=True)
+            await event.answer("This download is not active.", alert=True)
             await event.edit(buttons=None)
 
+    elif action == "cancel_fetch":
+        task = cancellable_tasks.pop(int(payload), None)
+        if task:
+            task.cancel()
+            await event.answer("❌ Fetch operation cancelled.")
+        else:
+            await event.answer("This operation is already complete or cancelled.", alert=True)
 
 # --- ADVANCED ERROR HANDLING ---
 async def alert_handler():
@@ -230,13 +249,12 @@ async def alert_handler():
         for alert in alerts:
             if alert.what() and alert.message():
                  print(f"[{alert.what()}] {alert.message()}")
-        await asyncio.sleep(1)
-
+        await asyncio.sleep(2) # Check every 2 seconds
 
 # --- Main Function ---
 async def main():
-    if BOT_TOKEN is None:
-        print("Error: BOT_TOKEN environment variable not set.")
+    if not BOT_TOKEN:
+        print("FATAL: BOT_TOKEN environment variable not set.")
         return
         
     if not os.path.exists(DOWNLOAD_PATH):
@@ -245,7 +263,6 @@ async def main():
     print("Bot is starting...")
     await client.start(bot_token=BOT_TOKEN)
     
-    # Start the advanced alert handler in the background
     asyncio.create_task(alert_handler())
     
     print("Bot has started successfully. Listening for magnet links...")
@@ -255,4 +272,4 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except Exception as e:
-        print(f"An error occurred in main: {e}")
+        print(f"A critical error occurred in main: {e}")
