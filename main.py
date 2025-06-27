@@ -60,25 +60,19 @@ async def get_torrent_info_from_magnet(magnet_link, message):
     """Fetches metadata from a magnet link without starting the download."""
     loop = asyncio.get_event_loop()
     try:
-        # **BUG FIX**: libtorrent requires a save_path even for metadata.
-        params = {
-            'save_path': DOWNLOAD_PATH,
-            'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-        }
-        lt.parse_magnet_uri(magnet_link, params)
+        # **BUG FIX**: Correctly call parse_magnet_uri and then modify the resulting params object.
+        params = await loop.run_in_executor(None, lt.parse_magnet_uri, magnet_link)
+        params.save_path = DOWNLOAD_PATH
         
-        temp_handle = await loop.run_in_executor(
-            None, lambda: ses.add_torrent(params)
-        )
+        temp_handle = await loop.run_in_executor(None, ses.add_torrent, params)
 
         await message.edit('🔎 Fetching torrent details... (This can take a moment for poorly seeded torrents)')
         while not await loop.run_in_executor(None, temp_handle.has_metadata):
             await asyncio.sleep(1)
 
         ti = await loop.run_in_executor(None, temp_handle.get_torrent_info)
-        await loop.run_in_executor(None, lambda: ses.remove_torrent(temp_handle))
+        await loop.run_in_executor(None, ses.remove_torrent, temp_handle)
         return ti
-    # **BUG FIX**: Catch the correct exceptions.
     except RuntimeError as e:
         error_message = str(e)
         if "invalid magnet uri" in error_message or "could not parse" in error_message:
@@ -86,13 +80,16 @@ async def get_torrent_info_from_magnet(magnet_link, message):
         else:
              await message.edit(f"**Error fetching metadata:**\n`{error_message}`")
         return None
+    except Exception as e:
+        await message.edit(f"**An unexpected critical error occurred:**\n`{e}`")
+        return None
 
 
 async def download_task(chat_id, magnet_link, message):
     """The main task that handles the download and progress updates."""
     loop = asyncio.get_event_loop()
     try:
-        params = await loop.run_in_executor(None, lambda: lt.parse_magnet_uri(magnet_link))
+        params = await loop.run_in_executor(None, lt.parse_magnet_uri, magnet_link)
         params.save_path = DOWNLOAD_PATH
         handle = await loop.run_in_executor(None, ses.add_torrent, params)
         
@@ -231,9 +228,8 @@ async def alert_handler():
     while True:
         alerts = await loop.run_in_executor(None, ses.pop_alerts)
         for alert in alerts:
-            # We only print alerts if they are in a category we subscribed to
             if alert.what() and alert.message():
-                 print(f"[ALERT] {alert.what()}: {alert.message()}")
+                 print(f"[{alert.what()}] {alert.message()}")
         await asyncio.sleep(1)
 
 
