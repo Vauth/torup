@@ -6,8 +6,8 @@ import asyncio
 import threading
 import http.server
 import socketserver
+import urllib.request
 import libtorrent as lt
-import urllib.request  # <-- ADDED IMPORT
 from urllib.parse import quote
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified
@@ -300,7 +300,7 @@ async def keep_alive_task():
             
             def blocking_ping():
                 try:
-                    with urllib.request.urlopen(BASE_URL, timeout=30) as response:
+                    with urllib.request.urlopen(BASE_URL, timeout=10) as response:
                         return response.status, "OK"
                 except Exception as e:
                     return None, str(e)
