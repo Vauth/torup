@@ -7,6 +7,7 @@ import threading
 import http.server
 import socketserver
 import libtorrent as lt
+import urllib.request  # <-- ADDED IMPORT
 from urllib.parse import quote
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified
@@ -290,6 +291,33 @@ def delete_torrent_files(torrent_info):
         return False
 
 
+async def keep_alive_task():
+    """A background task that pings the BASE_URL every hour to keep a web service alive."""
+    while True:
+        try:
+            print(f"Keep-alive: Pinging {BASE_URL} to prevent service from sleeping...")
+            loop = asyncio.get_event_loop()
+            
+            def blocking_ping():
+                try:
+                    with urllib.request.urlopen(BASE_URL, timeout=30) as response:
+                        return response.status, "OK"
+                except Exception as e:
+                    return None, str(e)
+
+            status, result = await loop.run_in_executor(None, blocking_ping)
+
+            if status and 200 <= status < 300:
+                print(f"Keep-alive: Ping successful (Status: {status}).")
+            else:
+                print(f"Keep-alive: Ping failed. Reason: {result}")
+
+        except Exception as e:
+            print(f"Keep-alive: An unexpected error occurred in the task loop: {e}")
+
+        await asyncio.sleep(3600)
+
+
 # --- Telegram Event Handlers ---
 @app.on_message(filters.command("start"))
 async def start(client, message):
@@ -426,7 +454,9 @@ def main():
     server_thread = threading.Thread(target=start_file_server, daemon=True)
     server_thread.start()
 
-    asyncio.get_event_loop().create_task(alert_handler())
+    loop = asyncio.get_event_loop()
+    loop.create_task(alert_handler())
+    loop.create_task(keep_alive_task())
 
     print("Bot has started successfully. Listening for magnet links...")
     app.run()
