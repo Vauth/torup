@@ -398,13 +398,23 @@ async def handle_callback(client, callback_query):
             file_name = os.path.basename(file_path)
             if os.path.isfile(file_path):
                 reporter = UploadProgressReporter(message, file_name)
-                await client.send_document(
-                    chat_id=chat_id,
-                    document=file_path,
-                    caption=f"`{file_name}`",
-                    force_document=False,
-                    progress=reporter
-                )
+                videoext = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv')
+                if file_name.lower().endswith(videoext):
+                    await client.send_video(
+                        chat_id=chat_id,
+                        video=file_path,
+                        caption=f"{file_name}",
+                        supports_streaming=True, # This enables streaming
+                        progress=reporter
+                    )
+                else:
+                    await client.send_document(
+                        chat_id=chat_id,
+                        document=file_path,
+                        caption=f"`{file_name}`",
+                        force_document=False,
+                        progress=reporter
+                    )
         
         delete_torrent_files(torrent_info)
         completed_torrents.pop(info_hash, None)
